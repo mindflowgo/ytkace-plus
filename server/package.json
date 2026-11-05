@@ -1,0 +1,15 @@
+{
+  "name": "ytkace-plus-recommendation-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Recommendation transform server for the YTKACE+ recommendations patch. Canonical endpoints: POST /yt-browse, POST /yt-next, GET / (health). Self-contained: Bun >= 1.0, no packages.",
+  "type": "module",
+  "scripts": {
+    "start": "bun run bun-recommendation-server.ts --action replace --port 8046 --log-file bun-server.log",
+    "start:passthrough": "bun run bun-recommendation-server.ts --action passthrough --port 8046 --log-file bun-server.log",
+    "start:timeout-test": "bun run bun-recommendation-server.ts --action replace --delay-ms 5000 --port 8046 --log-file bun-server.log"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}

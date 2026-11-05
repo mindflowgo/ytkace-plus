@@ -1,0 +1,4 @@
+node_modules/
+bun-server.log
+*.log
+dump/

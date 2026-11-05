@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+dist/
+IPA/*.app
+bun-server.log
+*.log
+.env
+
