@@ -495,7 +495,8 @@ class BunRecommendationServerTests(unittest.TestCase):
         process, base, logfile = start_bun(action="replace")
         self.addCleanup(lambda: (process.terminate(), process.wait(timeout=5)))
 
-        def save(video_id, ai, transcript_b64=None, transcript_status=None):
+        def save(video_id, ai, transcript_b64=None, transcript_status=None,
+                 ai_summary=None, ai_status=None):
             body = {"protocolVersion": 1, "type": "save",
                     "requestId": f"s-{video_id}", "videoId": video_id,
                     "ai": ai, "youtubeVersion": "21.33.6"}
@@ -504,6 +505,10 @@ class BunRecommendationServerTests(unittest.TestCase):
                 body["transcriptPayload"] = transcript_b64
             if transcript_status is not None:
                 body["transcriptStatus"] = transcript_status
+            if ai_summary is not None:
+                body["aiSummary"] = ai_summary
+            if ai_status is not None:
+                body["aiStatus"] = ai_status
             return post(base + "/yt-save", body)
 
         status, reply = save("48YfC8VCIsY", False, transcript_status="no-watch-response")
@@ -521,26 +526,34 @@ class BunRecommendationServerTests(unittest.TestCase):
             {"tStartMs": 0, "dDurationMs": 2000, "segs": [{"utf8": "first subtitle line"}]},
             {"tStartMs": 2000, "dDurationMs": 2000, "segs": [{"utf8": "second "}, {"utf8": "subtitle line"}]},
         ]}).encode()).decode()
-        status, reply = save("dQw4w9WgXcQ", False, transcript_b64=transcript)
+        status, reply = save("dQw4w9WgXcQ", True, transcript_b64=transcript,
+                             ai_summary="AI overview text about the video.",
+                             ai_status="ai-fetched")
         self.assertEqual(status, 200)
         self.assertTrue(reply["transcript"])
+        self.assertTrue(reply["aiSummary"])
         time.sleep(0.3)
         saves_path = Path(logfile).parent / "saves.jsonl"
         lines = [json.loads(line) for line in saves_path.read_text().splitlines()]
         self.assertEqual([entry["videoId"] for entry in lines],
                          ["48YfC8VCIsY", "s0V5g5MMunc", "dQw4w9WgXcQ"])
-        self.assertEqual([entry["ai"] for entry in lines], [False, True, False])
+        self.assertEqual([entry["ai"] for entry in lines], [False, True, True])
         self.assertEqual(lines[0]["requestId"], "s-48YfC8VCIsY")
         self.assertEqual(lines[0]["transcriptStatus"], "no-watch-response")
         self.assertIn("time", lines[0])
         self.assertNotIn("transcript", lines[0])
+        self.assertNotIn("aiOverview", lines[0])
         saved = lines[2]["transcript"]
         self.assertEqual(saved["encoding"], "youtube-json3")
         self.assertEqual(saved["b64"], transcript)
         self.assertEqual(saved["text"], "first subtitle line\nsecond subtitle line")
+        overview = lines[2]["aiOverview"]
+        self.assertEqual(overview["status"], "ai-fetched")
+        self.assertEqual(overview["summary"], "AI overview text about the video.")
         content = Path(logfile).read_text()
         self.assertIn("save: videoId=48YfC8VCIsY ai=false transcript=none", content)
-        self.assertIn("save: videoId=dQw4w9WgXcQ ai=false transcript=", content)
+        self.assertIn("save: videoId=dQw4w9WgXcQ ai=true transcript=", content)
+        self.assertIn("aiStatus=ai-fetched aiChars=33", content)
         self.assertIn("api: POST /yt-save -> 200", content)
 
     def test_save_endpoint_rejects_bad_bodies(self):

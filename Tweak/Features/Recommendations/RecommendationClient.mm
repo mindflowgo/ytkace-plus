@@ -217,6 +217,7 @@ void YTRCSendPlaybackEvent(NSString *event, NSString *videoId, NSDictionary *det
 
 void YTRCSendSaveRequest(NSString *videoId, BOOL aiEnhanced, NSData *transcript,
                          NSString *transcriptEncoding, NSString *transcriptStatus,
+                         NSString *aiSummary, NSString *aiStatus,
                          void (^completion)(BOOL, NSString *)) {
     void (^finish)(BOOL, NSString *) = ^(BOOL ok, NSString *message) {
         dispatch_async(dispatch_get_main_queue(), ^{ completion(ok, message); });
@@ -249,6 +250,8 @@ void YTRCSendSaveRequest(NSString *videoId, BOOL aiEnhanced, NSData *transcript,
         record[@"transcriptPayload"] = [transcript base64EncodedStringWithOptions:0];
     }
     if (transcriptStatus.length != 0) record[@"transcriptStatus"] = transcriptStatus;
+    if (aiSummary.length != 0) record[@"aiSummary"] = aiSummary;
+    if (aiStatus.length != 0) record[@"aiStatus"] = aiStatus;
     NSError *encodeError = nil;
     NSData *body = [NSJSONSerialization dataWithJSONObject:record options:0 error:&encodeError];
     if (body == nil) {

@@ -8,6 +8,7 @@
 #import "RecommendationCodec.h"
 #import "RecommendationClient.h"
 #import "RecommendationDelivery.h"
+#import "AITranscriptHook.h"
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -89,7 +90,7 @@ static dispatch_queue_t YTRCLogQueue(void) {
 }
 static NSMutableArray<NSDictionary *> *LogEvents;
 
-static void YTRCLog(NSDictionary *event) {
+void YTRCLog(NSDictionary *event) {
     if (!YTRCEnabled(DiagnosticsKey)) return;
     NSMutableDictionary *record = [event mutableCopy];
     record[@"time"] = @([NSDate.date timeIntervalSince1970]);
@@ -108,6 +109,39 @@ static YTRCContinuationIndex *YTRCContinuations(void) {
 }
 
 // ---------- Delivery pipeline ----------
+
+// The last delivered initial watch response's serialized bytes. The AI
+// Overview ("Ask") suggestion tokens ride it (base64url protobuf `kta-…`
+// strings embedding the video id and prompt text). Writes come from delivery
+// threads; lock-guarded.
+static id YTRCWatchPayloadLock(void) {
+    static id lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+static NSData *YTRCWatchPayloadData = nil;
+static NSString *YTRCWatchPayloadVideoId = nil;
+
+static void YTRCRememberWatchPayload(NSData *payload, NSString *videoId) {
+    @synchronized (YTRCWatchPayloadLock()) {
+        YTRCWatchPayloadData = payload;
+        YTRCWatchPayloadVideoId = [videoId copy];
+    }
+}
+
+NSData *YTRCCurrentWatchPayload(NSString **videoId) {
+    @synchronized (YTRCWatchPayloadLock()) {
+        if (videoId != nullptr) *videoId = [YTRCWatchPayloadVideoId copy];
+        return YTRCWatchPayloadData;
+    }
+}
+
+static NSString *YTRCActiveVideoId = nil;
+
+NSString *YTRCCurrentVideoId(void) {
+    return YTRCActiveVideoId;
+}
 
 @interface YTRCDeliveryContext : NSObject
 @property(nonatomic, copy) NSString *requestId;
@@ -174,6 +208,8 @@ static void YTRCProcessDelivery(YTRCDeliveryContext *context, id response,
         deliverNow();
         return;
     }
+    if ([context.surface isEqualToString:@"watch"] && [context.phase isEqualToString:@"initial"])
+        YTRCRememberWatchPayload(payload, context.videoId);
     NSString *fingerprint = YTRCSha256Prefix(payload);
     if (![YTRCRecent() shouldTransform:fingerprint ttl:YTRCDedupeTTL(context.surface)]) {
         YTRCBump(CounterSkippedDedupe);
@@ -436,7 +472,7 @@ static BOOL YTRCItemHasIdentifier(id item, NSString *wanted) {
     if (![item respondsToSelector:@selector(accessibilityIdentifier)]) return NO;
     @try {
         return [((id (*)(id, SEL))objc_msgSend)(item, @selector(accessibilityIdentifier)) isEqualToString:wanted];
-    } @catch (__unused NSException *exception) {
+    } @catch (NSException *exception) {
         return NO;
     }
 }
@@ -484,7 +520,6 @@ static void YTRCSettingsItems(id receiver, SEL selector, id items, unsigned long
 // The watch-page menu's Save action posts the currently playing video id.
 // Captured at every playback activation and watch-page fetch (both verified
 // boundaries), written from any thread, read on the main thread only.
-static NSString *YTRCActiveVideoId = nil;
 static void YTRCSetActiveVideoId(NSString *videoId) {
     if (videoId.length == 0) return;
     void (^store)(void) = ^{ YTRCActiveVideoId = [videoId copy]; };
@@ -521,7 +556,7 @@ static id YTRCTranscriptProbe(id object, NSArray<NSString *> *names) {
         @try {
             id value = ((id (*)(id, SEL))objc_msgSend)(object, selector);
             if (value != nil) return value;
-        } @catch (__unused NSException *exception) {
+        } @catch (NSException *exception) {
         }
     }
     return nil;
@@ -616,6 +651,8 @@ static void YTRCFetchTranscript(NSString *videoId, void (^completion)(NSData *, 
     }] resume];
 }
 
+// AI Overview and Gemini Prompting implementation is modularized in AITranscriptHook.{h,mm}
+
 // ---------- Playback observation (client-side, observation-only) ----------
 // YTPlayerViewController playback boundaries verified in the 21.33.6 class
 // dump. These hooks only report; they never modify playback. Events go to the
@@ -649,7 +686,7 @@ static BOOL YTRCBoolProperty(id object, NSString *name) {
     if (signature.numberOfArguments != 2 || strcmp(signature.methodReturnType, "B") != 0) return NO;
     @try {
         return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
-    } @catch (__unused NSException *exception) {
+    } @catch (NSException *exception) {
         return NO;
     }
 }
@@ -744,11 +781,65 @@ static void YTRCReelSequenceRetry(id receiver, SEL selector, id request, BOOL re
 + (void)setVisible:(BOOL)visible;       // sync with controls visibility (visibility hooks)
 + (void)toggle:(UIButton *)sender;
 + (void)show:(UIButton *)sender;
++ (void)showAiResult:(NSString *)text fromButton:(UIButton *)button;
++ (void)showAiGuidance:(NSString *)status fromButton:(UIButton *)button;
 + (void)rowTapped:(UIButton *)row;
 + (void)backdropTapped;
 @end
 
 static void YTRCMenuDismiss(void);
+
+// Observation wrapper for the InnerTube continuation callbacks whose block
+// shapes are multi-argument and therefore not transformable. The AI Overview
+// panel (sparkle button on the watch page) fetches through exactly these:
+//   (NSArray *, NSUInteger, id)             v32@?0@"NSArray"8Q16@24
+//   (NSArray *, NSUInteger, id, NSData *)   v40@?0@"NSArray"8Q16@24@"NSData"32
+// Records item classes + capped payloads so the AI request/response shape can
+// be inspected; the app's delivery is untouched.
+static id YTRCCaptureArrayCallback(id block, NSString *tag) {
+    if (block == nil) return block;
+    NSString *encoding = YTRCBlockSignature(block);
+    if (encoding.length == 0) return block;
+    NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:encoding.UTF8String];
+    if (strcmp(signature.methodReturnType, "v") != 0) return block;
+    NSUInteger count = signature.numberOfArguments;
+    if (count != 4 && count != 5) return block;
+    if ([signature getArgumentTypeAtIndex:1][0] != '@' || strcmp([signature getArgumentTypeAtIndex:2], "Q") != 0 ||
+        [signature getArgumentTypeAtIndex:3][0] != '@') return block;
+    void (^capture)(NSArray *) = ^(NSArray *items) {
+        if (![items isKindOfClass:NSArray.class]) return;
+        NSMutableArray<NSDictionary *> *summary = [NSMutableArray array];
+        NSUInteger index = 0;
+        for (id item in items) {
+            if (index++ >= 8) break;
+            NSError *error = nil;
+            NSData *bytes = YTRCSerializeMessage(item, 512 * 1024, &error);
+            if (bytes.length == 0) continue;
+            YTAICollectCaptureItem(bytes);
+            NSData *capped = bytes.length > 16384 ? [bytes subdataWithRange:NSMakeRange(0, 16384)] : bytes;
+            [summary addObject:@{@"class": NSStringFromClass([item class]) ?: @"?",
+                                 @"bytes": @(bytes.length),
+                                 @"payload": [capped base64EncodedStringWithOptions:0]}];
+        }
+        YTRCLog(@{@"event": @"continuation-capture", @"tag": tag, @"items": summary});
+    };
+    if (count == 4) {
+        void (^original)(NSArray *, NSUInteger, id) = block;
+        return [^(NSArray *items, NSUInteger itemIndex, id argument) {
+            capture(items);
+            original(items, itemIndex, argument);
+        } copy];
+    }
+    void (^original)(NSArray *, NSUInteger, id, NSData *) = block;
+    return [^(NSArray *items, NSUInteger itemIndex, id argument, NSData *data) {
+        if (data.length != 0)
+            YTRCLog(@{@"event": @"continuation-capture", @"tag": tag, @"dataBytes": @(data.length),
+                      @"dataPrefix": [[data base64EncodedStringWithOptions:0] substringToIndex:
+                          MIN((NSUInteger)160, [data base64EncodedStringWithOptions:0].length)]});
+        capture(items);
+        original(items, itemIndex, argument, data);
+    } copy];
+}
 
 // ---------- Hooks ----------
 
@@ -768,6 +859,216 @@ static IMP OriginalAppWatchFallback;
 static IMP OriginalImplWatchShort;
 static IMP OriginalImplWatchTimeout;
 static IMP OriginalCompositeWatch;
+static IMP OriginalPanelStreamingRequest;
+static IMP OriginalPanelCancel;
+static IMP OriginalAssistantRequest;
+static IMP OriginalAssistantRequestTimeout;
+
+// ---------- AI panel service trace (observation-only) ----------
+// YTStreamingPanelServiceImpl is the concrete service behind the app-scoped
+// proxy for AI panel continuations. Its handlers firing (or not) and any
+// cancellation distinguishes dispatch failure from lost response forwarding.
+static id YTRCPanelCaptureHandler(id block, NSString *kind);
+
+static id YTRCPanelStreamingRequest(id receiver, SEL selector, id request, BOOL refresh,
+                                    double timeout, int engagementType,
+                                    id valueHandler, id completionHandler) {
+    @try {
+        NSError *error = nil;
+        NSData *bytes = YTRCSerializeMessage(request, 256 * 1024, &error);
+        BOOL hasToken = bytes.length != 0 &&
+            [bytes rangeOfData:[@"kta-" dataUsingEncoding:NSUTF8StringEncoding]
+                       options:0 range:NSMakeRange(0, bytes.length)].location != NSNotFound;
+        YTRCLog(@{@"event": @"panel-request",
+                  @"requestClass": NSStringFromClass([request class]) ?: @"?",
+                  @"bytes": @(bytes.length),
+                  @"hasToken": @(hasToken),
+                  @"engagementType": @(engagementType),
+                  @"refresh": @(refresh),
+                  @"timeout": @(timeout)});
+    } @catch (NSException *exception) {
+    }
+    id wrappedValue = YTRCPanelCaptureHandler(valueHandler, @"value");
+    id wrappedCompletion = YTRCPanelCaptureHandler(completionHandler, @"completion");
+    return ((id (*)(id, SEL, id, BOOL, double, int, id, id))OriginalPanelStreamingRequest)(
+        receiver, selector, request, refresh, timeout, engagementType, wrappedValue, wrappedCompletion);
+}
+
+static void YTRCPanelCancel(id receiver, SEL selector, id token) {
+    YTRCLog(@{@"event": @"panel-cancel",
+              @"tokenPrefix": [token isKindOfClass:NSString.class]
+                  ? [(NSString *)token substringToIndex:MIN((NSUInteger)48, [(NSString *)token length])]
+                  : @"(nil)"});
+    ((void (*)(id, SEL, id))OriginalPanelCancel)(receiver, selector, token);
+}
+
+// ---------- YouTube Assistant (AI) capture (observation-only) ----------
+// The AI/"Ask" surface is server-gated, so instead of hardcoding a UI path
+// this records the request/response stream the first time the feature is used
+// manually. That reveals the exact request shape (and its query field), and
+// stashes the live, account-configured YTAssistantServiceImpl instance for
+// later replay. The app's own traffic is untouched.
+static __weak id YTRCAssistantServiceInstance = nil;
+static NSData *YTRCLastAssistantRequestBytes = nil;
+static NSData *YTRCLastAssistantResponseBytes = nil;
+
+static id YTRCPanelCaptureHandler(id block, NSString *kind) {
+    if (block == nil) return nil;
+    NSString *encoding = YTRCBlockSignature(block);
+    if (encoding.length == 0) return block;
+    NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:encoding.UTF8String];
+    if (strcmp(signature.methodReturnType, "v") != 0 || signature.numberOfArguments < 2 ||
+        strcmp([signature getArgumentTypeAtIndex:0], "@?") != 0) return block;
+    void (^logFire)(id) = ^(id argument) {
+        NSError *error = nil;
+        NSData *bytes = argument != nil ? YTRCSerializeMessage(argument, 512 * 1024, &error) : nil;
+        if (bytes.length != 0) {
+            YTAICollectCaptureItem(bytes);
+        }
+        YTRCLog(@{@"event": @"panel-handler", @"kind": kind,
+                  @"argClass": argument != nil ? (NSStringFromClass([argument class]) ?: @"?") : @"(nil)",
+                  @"bytes": @(bytes.length)});
+    };
+    if (signature.numberOfArguments == 2) {
+        void (^original)(id) = block;
+        return [^(id argument) { logFire(argument); original(argument); } copy];
+    }
+    if (signature.numberOfArguments == 3) {
+        const char *auxiliary = [signature getArgumentTypeAtIndex:2];
+        if (auxiliary[0] == '@' && auxiliary[1] != '?') {
+            void (^original)(id, id) = block;
+            return [^(id argument, id extra) {
+                logFire(argument);
+                if (extra != nil) logFire(extra);
+                original(argument, extra);
+            } copy];
+        }
+        if (strcmp(auxiliary, "B") == 0) {
+            void (^original)(id, bool) = block;
+            return [^(id argument, bool flag) { logFire(argument); original(argument, flag); } copy];
+        }
+    }
+    YTRCLog(@{@"event": @"panel-handler", @"kind": kind,
+              @"signature": @"unsupported", @"encoding": encoding});
+    return block;
+}
+
+static void YTRCCaptureAssistantObject(NSString *event, id object, NSData *__strong *store) {
+    if (object == nil) return;
+    NSError *error = nil;
+    NSData *bytes = YTRCSerializeMessage(object, 1024 * 1024, &error);
+    if (bytes.length == 0) return;
+    *store = bytes;
+    YTAICollectCaptureItem(bytes);
+    NSData *capped = bytes.length > 24576 ? [bytes subdataWithRange:NSMakeRange(0, 24576)] : bytes;
+    YTRCLog(@{@"event": event, @"class": NSStringFromClass([object class]) ?: @"?",
+              @"bytes": @(bytes.length), @"truncated": @(bytes.length > capped.length),
+              @"payload": [capped base64EncodedStringWithOptions:0]});
+}
+
+// Wraps the service's response block (arity detected from its signature, so a
+// variant shape is passed through untouched instead of being mis-called).
+static id YTRCAssistantWrappedResponse(id block) {
+    if (block == nil) return nil;
+    NSString *encoding = YTRCBlockSignature(block);
+    if (encoding.length == 0) return block;
+    NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:encoding.UTF8String];
+    if (strcmp(signature.methodReturnType, "v") != 0 || signature.numberOfArguments < 2 ||
+        strcmp([signature getArgumentTypeAtIndex:0], "@?") != 0) return block;
+    if (signature.numberOfArguments == 2) {
+        void (^original)(id) = block;
+        return [^(id response) {
+            YTRCCaptureAssistantObject(@"assistant-response", response, &YTRCLastAssistantResponseBytes);
+            original(response);
+        } copy];
+    }
+    if (signature.numberOfArguments == 3) {
+        const char *auxiliary = [signature getArgumentTypeAtIndex:2];
+        if (auxiliary[0] == '@' && auxiliary[1] != '?') {
+            void (^original)(id, id) = block;
+            return [^(id response, id argument) {
+                YTRCCaptureAssistantObject(@"assistant-response", response, &YTRCLastAssistantResponseBytes);
+                original(response, argument);
+            } copy];
+        }
+        if (strcmp(auxiliary, "B") == 0) {
+            void (^original)(id, bool) = block;
+            return [^(id response, bool flag) {
+                YTRCCaptureAssistantObject(@"assistant-response", response, &YTRCLastAssistantResponseBytes);
+                original(response, flag);
+            } copy];
+        }
+        if (strcmp(auxiliary, "^v") == 0) {
+            void (^original)(id, void *) = block;
+            return [^(id response, void *argument) {
+                YTRCCaptureAssistantObject(@"assistant-response", response, &YTRCLastAssistantResponseBytes);
+                original(response, argument);
+            } copy];
+        }
+    }
+    return block;
+}
+
+// One-shot snapshot of the AI ("Ask") UI structure at the moment the service
+// first fires: presented controller chain plus a bounded view-tree dump with
+// editable fields, identifiers, labels and frames. This is what the replay
+// implementation is built from (input field + send button + panel class).
+static void YTRCDumpAssistantUI(void) {
+    UIWindow *window = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *candidate in ((UIWindowScene *)scene).windows)
+            if (candidate.isKeyWindow) window = candidate;
+    }
+    NSMutableArray<NSString *> *chain = [NSMutableArray array];
+    for (UIViewController *controller = window.rootViewController;
+         controller != nil && chain.count < 8; controller = controller.presentedViewController)
+        [chain addObject:NSStringFromClass(controller.class)];
+    NSMutableArray<NSString *> *views = [NSMutableArray array];
+    __block NSUInteger budget = 150;
+    __block __weak void (^weakWalk)(UIView *, NSUInteger);
+    void (^walk)(UIView *, NSUInteger) = ^(UIView *view, NSUInteger depth) {
+        if (view == nil || depth > 9 || budget == 0) return;
+        budget--;
+        BOOL editable = [view isKindOfClass:UITextView.class] || [view isKindOfClass:UITextField.class];
+        NSString *identifier = view.accessibilityIdentifier ?: @"";
+        NSString *label = view.accessibilityLabel ?: @"";
+        if (editable || identifier.length != 0 || label.length != 0 || [view isKindOfClass:UIControl.class]) {
+            [views addObject:[NSString stringWithFormat:@"%@%s id=%@ label=%@ frame=%@",
+                NSStringFromClass(view.class), editable ? " [EDITABLE]" : "",
+                identifier, label, NSStringFromCGRect(view.frame)]];
+        }
+        for (UIView *subview in view.subviews) weakWalk(subview, depth + 1);
+    };
+    weakWalk = walk;
+    walk(window, 0);
+    YTRCLog(@{@"event": @"assistant-ui", @"chain": chain, @"views": views});
+}
+
+static void YTRCAssistantCapture(id receiver, id request) {
+    YTRCAssistantServiceInstance = receiver;
+    YTRCCaptureAssistantObject(@"assistant-request", request, &YTRCLastAssistantRequestBytes);
+    static BOOL dumpedUI = NO;
+    if (!dumpedUI) {
+        dumpedUI = YES;
+        dispatch_async(dispatch_get_main_queue(), ^{ YTRCDumpAssistantUI(); });
+    }
+}
+
+static void YTRCAssistantRequest(id receiver, SEL selector, id request, BOOL refresh,
+                                 id responseBlock, id errorBlock) {
+    YTRCAssistantCapture(receiver, request);
+    ((void (*)(id, SEL, id, BOOL, id, id))OriginalAssistantRequest)(
+        receiver, selector, request, refresh, YTRCAssistantWrappedResponse(responseBlock), errorBlock);
+}
+
+static void YTRCAssistantRequestTimeout(id receiver, SEL selector, id request, BOOL refresh,
+                                        id responseBlock, id errorBlock, double timeout) {
+    YTRCAssistantCapture(receiver, request);
+    ((void (*)(id, SEL, id, BOOL, id, id, double))OriginalAssistantRequestTimeout)(
+        receiver, selector, request, refresh, YTRCAssistantWrappedResponse(responseBlock),
+        errorBlock, timeout);
+}
 static IMP OriginalControlsOverlayLayout;
 static IMP OriginalVideoOverlayLayout;
 static IMP OriginalControlsSetOverlayVisible;
@@ -848,9 +1149,14 @@ static void YTRCBrowse(id receiver, SEL selector, id request, BOOL refresh, id r
 // this class (hooked separately, gated by the Subs/History toggle).
 static void YTRCFeedContinuation(id receiver, SEL selector, unsigned long long feedType,
                                  id initialBlock, id block, id errorResponseBlock) {
+    // Capture runs ungated (diagnostic only): the AI Overview panel fetches
+    // through these callbacks for some layouts.
+    YTAICaptureFeedDataSource(receiver, @"feed");
+    id observedInitial = YTRCCaptureArrayCallback(initialBlock, @"feed-initial");
+    id observedContinuation = YTRCCaptureArrayCallback(block, @"feed-continuation");
     if (!YTRCCategoryEnabled(@"home")) {
         ((void (*)(id, SEL, unsigned long long, id, id, id))OriginalFeedContinuation)(
-            receiver, selector, feedType, initialBlock, block, errorResponseBlock);
+            receiver, selector, feedType, observedInitial, observedContinuation, errorResponseBlock);
         return;
     }
     YTRCDeliveryContext *(^providerWithPhase)(NSString *) = ^YTRCDeliveryContext *(NSString *phase) {
@@ -864,9 +1170,9 @@ static void YTRCFeedContinuation(id receiver, SEL selector, unsigned long long f
         context.requestContext = @{@"feedType": @(feedType)};
         return context;
     };
-    id wrappedInitial = YTRCWrapForTransform(initialBlock, @"home", @"YTIBrowseResponse",
+    id wrappedInitial = YTRCWrapForTransform(observedInitial, @"home", @"YTIBrowseResponse",
         ^{ return providerWithPhase(@"initial"); }, nullptr);
-    id wrappedContinuation = YTRCWrapForTransform(block, @"home", @"YTIBrowseResponse",
+    id wrappedContinuation = YTRCWrapForTransform(observedContinuation, @"home", @"YTIBrowseResponse",
         ^{ return providerWithPhase(@"continuation"); }, nullptr);
     ((void (*)(id, SEL, unsigned long long, id, id, id))OriginalFeedContinuation)(
         receiver, selector, feedType, wrappedInitial, wrappedContinuation, errorResponseBlock);
@@ -878,10 +1184,45 @@ static void YTRCFeedContinuation(id receiver, SEL selector, unsigned long long f
 static void YTRCTeaserContinuation(id receiver, SEL selector, id token, unsigned long long continuationType,
                                    id attachment, BOOL cacheEnabled, id clickTracking, BOOL alwaysParseFeedNode,
                                    id responseBlock, id errorBlock) {
+    // The live data source is the replay vehicle for the AI Overview fetch.
+    YTAICaptureFeedDataSource(receiver, @"teaser");
+    // AI-style continuations reveal which data source/service the app itself
+    // uses for the panel. Log the full native call shape (service, type,
+    // attachment, click tracking) and retain that data source + arguments
+    // separately from generic feed instances.
+    if ([token isKindOfClass:NSString.class] && [(NSString *)token hasPrefix:@"kta-"]) {
+        YTAINoteContinuation((NSString *)token);
+        id service = nil;
+        if ([receiver respondsToSelector:@selector(service)])
+            service = ((id (*)(id, SEL))objc_msgSend)(receiver, @selector(service));
+        id innerService = nil;
+        SEL resolve = NSSelectorFromString(@"getInnerTubeUIServiceForActiveIdentity");
+        if (service != nil && [service respondsToSelector:resolve])
+            innerService = ((id (*)(id, SEL))objc_msgSend)(service, resolve);
+        YTRCLog(@{@"event": @"ai-continuation", @"source": @"teaser",
+                  @"tokenPrefix": [(NSString *)token substringToIndex:MIN((NSUInteger)48, [(NSString *)token length])],
+                  @"type": @(continuationType),
+                  @"attachment": attachment != nil ? NSStringFromClass([attachment class]) : @"(none)",
+                  @"clickTracking": clickTracking != nil ? NSStringFromClass([clickTracking class]) : @"(none)",
+                  @"dataSource": NSStringFromClass([receiver class]) ?: @"?",
+                  @"service": service != nil ? NSStringFromClass([service class]) : @"(none)",
+                  @"innerService": innerService != nil ? NSStringFromClass([innerService class]) : @"(none)",
+                  @"cacheEnabled": @(cacheEnabled),
+                  @"alwaysParse": @(alwaysParseFeedNode)});
+        YTAINoteNativeContinuation(receiver, continuationType, attachment, clickTracking, cacheEnabled, alwaysParseFeedNode);
+    }
+    // Capture runs ungated (diagnostic only): the AI Overview panel fetches
+    // through these continuation callbacks.
+    id observed = YTRCCaptureArrayCallback(responseBlock, @"browse-teaser");
+    if ([token isKindOfClass:NSString.class] && [(NSString *)token length] != 0) {
+        YTRCLog(@{@"event": @"continuation-request", @"tag": @"browse-teaser",
+                  @"tokenPrefix": [(NSString *)token substringToIndex:MIN((NSUInteger)48, [(NSString *)token length])],
+                  @"feedType": @(continuationType)});
+    }
     if (!YTRCCategoryEnabled(@"browse-teaser")) {
         ((void (*)(id, SEL, id, unsigned long long, id, BOOL, id, BOOL, id, id))OriginalTeaserContinuation)(
             receiver, selector, token, continuationType, attachment, cacheEnabled, clickTracking,
-            alwaysParseFeedNode, responseBlock, errorBlock);
+            alwaysParseFeedNode, observed, errorBlock);
         return;
     }
     NSDictionary *requestContext = [token isKindOfClass:NSString.class] && [(NSString *)token length] != 0
@@ -897,7 +1238,7 @@ static void YTRCTeaserContinuation(id receiver, SEL selector, id token, unsigned
         context.requestContext = requestContext;
         return context;
     };
-    id wrapped = YTRCWrapForTransform(responseBlock, @"browse-teaser", @"", provider, nullptr);
+    id wrapped = YTRCWrapForTransform(observed, @"browse-teaser", @"", provider, nullptr);
     ((void (*)(id, SEL, id, unsigned long long, id, BOOL, id, BOOL, id, id))OriginalTeaserContinuation)(
         receiver, selector, token, continuationType, attachment, cacheEnabled, clickTracking,
         alwaysParseFeedNode, wrapped, errorBlock);
@@ -906,9 +1247,16 @@ static void YTRCTeaserContinuation(id receiver, SEL selector, id token, unsigned
 static void YTRCTeaserContinuationShort(id receiver, SEL selector, id token, BOOL cacheEnabled,
                                         id clickTracking, BOOL alwaysParseFeedNode,
                                         id responseBlock, id errorBlock) {
+    YTAICaptureFeedDataSource(receiver, @"teaser-short");
+    // Capture runs ungated (diagnostic only).
+    id observed = YTRCCaptureArrayCallback(responseBlock, @"browse-teaser-short");
+    if ([token isKindOfClass:NSString.class] && [(NSString *)token length] != 0) {
+        YTRCLog(@{@"event": @"continuation-request", @"tag": @"browse-teaser-short",
+                  @"tokenPrefix": [(NSString *)token substringToIndex:MIN((NSUInteger)48, [(NSString *)token length])]});
+    }
     if (!YTRCCategoryEnabled(@"browse-teaser")) {
         ((void (*)(id, SEL, id, BOOL, id, BOOL, id, id))OriginalTeaserContinuationShort)(
-            receiver, selector, token, cacheEnabled, clickTracking, alwaysParseFeedNode, responseBlock, errorBlock);
+            receiver, selector, token, cacheEnabled, clickTracking, alwaysParseFeedNode, observed, errorBlock);
         return;
     }
     NSDictionary *requestContext = [token isKindOfClass:NSString.class] && [(NSString *)token length] != 0
@@ -923,7 +1271,7 @@ static void YTRCTeaserContinuationShort(id receiver, SEL selector, id token, BOO
         context.requestContext = requestContext;
         return context;
     };
-    id wrapped = YTRCWrapForTransform(responseBlock, @"browse-teaser", @"", provider, nullptr);
+    id wrapped = YTRCWrapForTransform(observed, @"browse-teaser", @"", provider, nullptr);
     ((void (*)(id, SEL, id, BOOL, id, BOOL, id, id))OriginalTeaserContinuationShort)(
         receiver, selector, token, cacheEnabled, clickTracking, alwaysParseFeedNode, wrapped, errorBlock);
 }
@@ -1143,6 +1491,20 @@ static void YTRCInstallHooks(void) {
         "v@:@B@?@?", (IMP)YTRCAppSearch, &OriginalAppSearch);
     YTRCInstall(@"YTSearchServiceImpl", @"makeRequest:refresh:responseBlock:errorBlock:",
         "v@:@B@?@?", (IMP)YTRCSearchImpl, &OriginalSearchImpl);
+    // AI panel service trace: request dispatch, handler delivery, and
+    // cancellation on the concrete streaming panel service.
+    YTRCInstall(@"YTStreamingPanelServiceImpl",
+        @"makeStreamingRequest:refresh:timeoutInterval:engagementType:valueHandler:completionHandler:",
+        "@@:@Bdi@?@?", (IMP)YTRCPanelStreamingRequest, &OriginalPanelStreamingRequest);
+    YTRCInstall(@"YTStreamingPanelServiceImpl", @"cancelContinuationRequestWithToken:",
+        "v@:@", (IMP)YTRCPanelCancel, &OriginalPanelCancel);
+    // YouTube Assistant (AI) observation: records the request/response of a
+    // manual AI use, revealing the exact request shape and the live service
+    // instance for later replay. Observation-only.
+    YTRCInstall(@"YTAssistantServiceImpl", @"makeRequest:refresh:responseBlock:errorBlock:",
+        "v@:@B@?@?", (IMP)YTRCAssistantRequest, &OriginalAssistantRequest);
+    YTRCInstall(@"YTAssistantServiceImpl", @"makeRequest:refresh:responseBlock:errorBlock:timeoutInterval:",
+        "v@:@B@?@?d", (IMP)YTRCAssistantRequestTimeout, &OriginalAssistantRequestTimeout);
     // Player-controls launcher: both overlay classes act as layout ticks (the
     // cog may be built into either's subtree); visibility selectors sync the
     // button (and collapse the menu) with the tap-the-video chrome.
@@ -1340,7 +1702,11 @@ static void YTRCInstallHooks(void) {
             [counters addObject:@(YTRCCounter(index))];
         NSDictionary *report = @{@"module": @"recommendations", @"counters": counters,
                                  @"events": LogEvents ?: @[],
-                                 @"notice": @"Metadata only; payloads are never recorded."};
+                                 @"assistantRequest": YTRCLastAssistantRequestBytes != nil
+                                     ? [YTRCLastAssistantRequestBytes base64EncodedStringWithOptions:0] : @"",
+                                 @"assistantResponse": YTRCLastAssistantResponseBytes != nil
+                                     ? [YTRCLastAssistantResponseBytes base64EncodedStringWithOptions:0] : @"",
+                                 @"notice": @"Metadata only; recommendation payloads are never recorded. assistantRequest/assistantResponse populate only after the AI feature has been used once."};
         NSData *json = [NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted error:nil];
         NSURL *file = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"recommendations-%@.json", NSUUID.UUID.UUIDString]]];
@@ -1559,12 +1925,33 @@ static void YTRCMenuShow(UIButton *button) {
 static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
     YTRCShowNote(anchor, @"Saving…", YES);
     NSString *videoId = YTRCActiveVideoId;
-    // Gather the transcript first (fail-soft, bounded), then post both. The
-    // status string ships with the save so the server log explains misses.
-    YTRCFetchTranscript(videoId, ^(NSData *transcript, NSString *status) {
-        YTRCSendSaveRequest(videoId, ai, transcript, @"youtube-json3", status, ^(BOOL ok, NSString *message) {
-            if (ok && transcript.length != 0) message = @"Saved + transcript";
-            YTRCShowNote(anchor, message, ok);
+    // Gather the transcript first (fail-soft, bounded), then — for Save w/ AI
+    // — replay the AI Overview request, then post everything together.
+    YTRCFetchTranscript(videoId, ^(NSData *transcript, NSString *transcriptStatus) {
+        if (!ai) {
+            YTRCSendSaveRequest(videoId, NO, transcript, @"youtube-json3", transcriptStatus, nil, nil,
+                ^(BOOL ok, NSString *message) {
+                    if (ok && transcript.length != 0) message = @"Saved + transcript";
+                    YTRCShowNote(anchor, message, ok);
+                });
+            return;
+        }
+        YTRCShowNote(anchor, @"Asking Gemini…", YES);
+        YTAIFetchSummary(videoId, ^(NSString *summary, NSString *aiStatus) {
+            YTRCSendSaveRequest(videoId, YES, transcript, @"youtube-json3", transcriptStatus, summary, aiStatus,
+                ^(BOOL ok, NSString *message) {
+                    if (summary.length != 0) {
+                        YTAICloseAiPanel();
+                        YTRCShowNote(anchor, ok ? @"Saved + AI overview" : message, ok);
+                    } else {
+                        if (ok) {
+                            YTRCShowNote(anchor, @"Saved", YES);
+                            [YTRCLauncher showAiGuidance:aiStatus fromButton:anchor];
+                        } else {
+                            YTRCShowNote(anchor, message, ok);
+                        }
+                    }
+                });
         });
     });
 }
@@ -1670,6 +2057,19 @@ static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
 }
 + (void)backdropTapped {
     YTRCMenuDismiss();
+}
++ (void)showAiGuidance:(NSString *)status fromButton:(UIButton *)button {
+    UIViewController *host = button.window.rootViewController;
+    while (host.presentedViewController != nil) host = host.presentedViewController;
+    if (host == nil) return;
+    YTAIShowGuidanceAlert(status, host);
+}
+
++ (void)showAiResult:(NSString *)text fromButton:(UIButton *)button {
+    UIViewController *host = button.window.rootViewController;
+    while (host.presentedViewController != nil) host = host.presentedViewController;
+    if (host == nil) return;
+    YTAIShowResultModal(text, host);
 }
 + (void)show:(UIButton *)sender {
     UIViewController *host = sender.window.rootViewController;

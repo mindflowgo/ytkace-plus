@@ -17,8 +17,8 @@ def main():
     args = parser.parse_args()
     source = (ROOT / 'Tweak/Features/Recommendations/RecommendationHooks.mm').read_text()
     hooks = re.findall(r'YTRCInstall\(@"([^"]+)",\s*\n?\s*@"([^"]+)",\s*\n?\s*"([^"]+)"', source)
-    if len(hooks) != 26:
-        raise SystemExit(f'Expected 26 hook declarations; found {len(hooks)}')
+    if len(hooks) != 30:
+        raise SystemExit(f'Expected 30 hook declarations; found {len(hooks)}')
     names = {cls for cls, _, _ in hooks}
     with args.executable.open('rb') as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
         image = ObjCImage(data)

@@ -1364,6 +1364,11 @@ async function handleSave(request: Request): Promise<Response> {
   const ai = record.ai === true;
   const transcriptStatus = typeof record.transcriptStatus === "string"
     ? record.transcriptStatus.slice(0, 200) : null;
+  // Save w/ AI: the replayed AI Overview text (already extracted app-side)
+  // and the outcome of that replay.
+  const aiSummary = typeof record.aiSummary === "string" && record.aiSummary.length !== 0
+    ? record.aiSummary.slice(0, 400_000) : null;
+  const aiStatus = typeof record.aiStatus === "string" ? record.aiStatus.slice(0, 200) : null;
   const entry = {
     time: new Date().toISOString(),
     requestId: typeof record.requestId === "string" ? record.requestId : null,
@@ -1372,6 +1377,8 @@ async function handleSave(request: Request): Promise<Response> {
     youtubeVersion: typeof record.youtubeVersion === "string" ? record.youtubeVersion : null,
     ...(transcriptStatus !== null ? { transcriptStatus } : {}),
     ...(transcript !== undefined ? { transcript } : {}),
+    ...(aiStatus !== null || aiSummary !== null
+      ? { aiOverview: { status: aiStatus, summary: aiSummary } } : {}),
   };
   if (options.savesLogFile !== null) {
     try {
@@ -1382,8 +1389,15 @@ async function handleSave(request: Request): Promise<Response> {
   }
   const hasTranscript = transcript !== undefined;
   log(`save: videoId=${videoId} ai=${ai} transcript=${hasTranscript ? `${transcript.bytes}B` : "none"}` +
-      ` status=${transcriptStatus ?? "-"} requestId=${entry.requestId ?? "-"}`);
-  return json({ ok: true, videoId, ai, transcript: hasTranscript });
+      ` status=${transcriptStatus ?? "-"}` +
+      (ai ? ` aiStatus=${aiStatus ?? "-"} aiChars=${aiSummary?.length ?? 0}` : "") +
+      ` requestId=${entry.requestId ?? "-"}`);
+  if (aiSummary !== null) {
+    // Readable in the server log; JSON.stringify keeps newlines on one line.
+    const preview = aiSummary.length > 4000 ? `${aiSummary.slice(0, 4000)}…` : aiSummary;
+    log(`save-ai: ${JSON.stringify(preview)}`);
+  }
+  return json({ ok: true, videoId, ai, transcript: hasTranscript, aiSummary: aiSummary !== null });
 }
 
 async function handleTransform(request: Request, path: string): Promise<Response> {

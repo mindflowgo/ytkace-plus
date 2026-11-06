@@ -67,15 +67,17 @@ FOUNDATION_EXPORT void YTRCSendPlaybackEvent(NSString *event, NSString * _Nullab
 
 // Explicit save request from the watch menu (POST /yt-save). The body
 // carries the 11-character videoId, an `ai` flag distinguishing a plain
-// save from "Save w/ AI", the transcript outcome (`transcriptStatus`, e.g.
-// fetched / no-caption-tracks / fetch-failed:…), and optionally the video's
-// transcript as raw YouTube json3 caption bytes, base64-encoded and tagged
-// `transcriptEncoding: "youtube-json3"`. `completion` always runs on the
-// main queue with a short user-presentable message.
+// save from "Save w/ AI", the transcript outcome (`transcriptStatus`), the
+// AI Overview outcome (`aiStatus`), optionally the video's transcript as raw
+// YouTube json3 caption bytes (base64, `transcriptEncoding: "youtube-json3"`),
+// and for Save w/ AI the replayed AI Overview text (`aiSummary`).
+// `completion` always runs on the main queue with a short user message.
 FOUNDATION_EXPORT void YTRCSendSaveRequest(NSString * _Nullable videoId, BOOL aiEnhanced,
                                            NSData * _Nullable transcript,
                                            NSString * _Nullable transcriptEncoding,
                                            NSString * _Nullable transcriptStatus,
+                                           NSString * _Nullable aiSummary,
+                                           NSString * _Nullable aiStatus,
                                            void (^completion)(BOOL ok, NSString * _Nonnull message));
 
 // Connection test: GET the configured URL and require HTTP 200 with a JSON

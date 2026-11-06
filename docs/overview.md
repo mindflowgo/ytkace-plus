@@ -54,10 +54,10 @@ Two layers: a Mach-O load command and runtime Objective-C hooks.
    semi-transparent square below the settings cog of the tap-the-video
    chrome: Save / Save w/ AI / Settings).
 
-2. **Runtime hooks (26, ABI-checked, fail-closed).** Each hook verifies the
+2. **Runtime hooks (30, ABI-checked, fail-closed).** Each hook verifies the
    method's full type encoding before installing (`YTRCMethodMatches`); a
    missing or changed method is logged and left unhooked — the app keeps
-   running stock. `Scripts/verify-recommendation-signatures.py` checks all 26
+   running stock. `Scripts/verify-recommendation-signatures.py` checks all 30
    encodings against the target executable before you package.
 
    | # | Class / selector (encoding) | Purpose |
@@ -77,6 +77,8 @@ Two layers: a Mach-O load command and runtime Objective-C hooks.
    | 18–19 | `YTGetReelWatchSequenceServiceImpl makeYTIReelWatchSequenceRequest:responseBlock:errorBlock:` (`@@:@@?@?`) + `…retryEnabled:responseBlock:errorBlock:` (`@@:@B@?@?`) | **Shorts feed batches** — the vertical player's `/reel/reel_watch_sequence` equivalent; surface `shorts`, sent to `/yt-reels`. |
    | 20–22 | `YTPlayerViewController playbackController:didActivateVideo:withPlaybackData:` (`v@:@@@`), `playbackControllerDidFinishPlayback:` (`v@:@`), `pauseWithStopageReason:` (`v@:i`) | Observation-only playback events (`activate` / `pause` / `finish`) to `/yt-playback`. Raw media-state transitions are deliberately not reported. |
    | 23–26 | `YTMainAppControlsOverlayView` + `YTMainAppVideoPlayerOverlayView` `layoutSubviews` (`v@:`), `setOverlayVisible:` / `setControlsOverlayVisible:` (`v@:B`) | Not fetch boundaries: player-controls chrome. Layout ticks host the launcher button at window level, constrained under the discovered settings cog (hint match in the top-right region, whole-window search fallback); visibility selectors fade it with the chrome and collapse any open menu. |
+   | 27–28 | `YTAssistantServiceImpl makeRequest:refresh:responseBlock:errorBlock:` (`v@:@B@?@?`) + `…timeoutInterval:` (`v@:@B@?@?d`) | Observation-only: records the AI ("Ask"/Assistant) request/response the first time the server-gated feature is used, including the live account-configured service instance — the basis for replaying the AI request programmatically. App traffic is untouched. |
+   | 29–30 | `YTStreamingPanelServiceImpl makeStreamingRequest:refresh:timeoutInterval:engagementType:valueHandler:completionHandler:` (`@@:@Bdi@?@?`) + `cancelContinuationRequestWithToken:` (`v@:@`) | Observation-only trace for the AI panel's concrete service: request dispatch (class/size/token presence), handler delivery (argument class/size), and continuation cancellation. Distinguishes dispatch failure from lost response forwarding; callbacks pass through untouched. |
 
    Deliberately **not** hooked: `/player` (actual video playback — it is not a
    recommendation list), comment-thread services, `/guide`, `/att/get`,

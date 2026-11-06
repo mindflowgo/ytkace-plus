@@ -17,10 +17,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$ROOT/../ytkace/IPA/YouTube_iOS16.app"
 SKIP_TESTS=0
+BUILD_RELEASE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app) APP="$2"; shift 2 ;;
     --skip-tests) SKIP_TESTS=1; shift ;;
+    --release) BUILD_RELEASE=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -55,9 +57,12 @@ else
   bash "$ROOT/Scripts/test-recommendations.sh"
 fi
 
-echo "== [4/5] package IPAs (auto-incrementing _vN)"
+echo "== [4/5] package IPA (auto-incrementing _vN)"
 DEV_IPA="$(python3 "$ROOT/Scripts/package-recommendations.py" "$APP" --allow-insecure-http-dev | tail -1)"
-CLEAN_IPA="$(python3 "$ROOT/Scripts/package-recommendations.py" "$APP" --clean | tail -1)"
+CLEAN_IPA=""
+if [[ "$BUILD_RELEASE" == "1" ]]; then
+  CLEAN_IPA="$(python3 "$ROOT/Scripts/package-recommendations.py" "$APP" --clean | tail -1)"
+fi
 
 echo "== [5/5] verify artifacts"
 bash "$ROOT/Tools/verify-artifacts.sh" "$ROOT/dist/recommendations/YTKACERecommendations.dylib" "$DEV_IPA"
@@ -67,5 +72,7 @@ if [[ -n "$EXTRACTED" ]]; then rm -rf "$EXTRACTED"; fi
 echo
 echo "== done"
 echo "   dev-ATS (http LAN testing): $DEV_IPA"
-echo "   clean (HTTPS endpoints):    $CLEAN_IPA"
+if [[ -n "$CLEAN_IPA" ]]; then
+  echo "   clean (HTTPS endpoints):    $CLEAN_IPA"
+fi
 echo "   install the highest _vN via your sideloader (iLoader re-sign required)"

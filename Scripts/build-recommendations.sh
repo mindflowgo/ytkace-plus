@@ -14,6 +14,7 @@ xcrun --sdk iphoneos clang++ \
   "$ROOT/Tweak/Features/Recommendations/RecommendationCodec.mm" \
   "$ROOT/Tweak/Features/Recommendations/RecommendationClient.mm" \
   "$ROOT/Tweak/Features/Recommendations/RecommendationDelivery.mm" \
+  "$ROOT/Tweak/Features/Recommendations/AITranscriptHook.mm" \
   "$ROOT/Tweak/Features/Recommendations/RecommendationHooks.mm" \
   -framework Foundation -framework UIKit -framework CoreGraphics \
   -Wl,-install_name,@rpath/YTKACERecommendations.dylib \
