@@ -4,6 +4,7 @@
 @implementation YTRCDeliveryState {
     os_unfair_lock _lock;
     BOOL _resolved;
+    BOOL _inFlightDecremented;
 }
 - (instancetype)initWithRequestIdentifier:(NSString *)requestId {
     self = [super init];
@@ -19,6 +20,13 @@
 }
 - (BOOL)claimReplacement { return [self claimWithSelector:^{ return YES; }]; }
 - (BOOL)claimOriginal { return [self claimWithSelector:^{ return YES; }]; }
+- (BOOL)claimInFlightDecrement {
+    os_unfair_lock_lock(&_lock);
+    BOOL won = !_inFlightDecremented;
+    _inFlightDecremented = YES;
+    os_unfair_lock_unlock(&_lock);
+    return won;
+}
 - (BOOL)isResolved {
     os_unfair_lock_lock(&_lock);
     BOOL resolved = _resolved;

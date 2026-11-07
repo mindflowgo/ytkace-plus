@@ -114,6 +114,15 @@ class MockRecommendationServerTests(unittest.TestCase):
         finally:
             server.shutdown()
 
+    def test_not_modified_action(self):
+        server, url = start_server(action="not-modified")
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                post(url, envelope(base64.b64encode(b"\x08\x01").decode()))
+            self.assertEqual(caught.exception.code, 304)
+        finally:
+            server.shutdown()
+
     def test_other_fallback_modes_still_answer_200(self):
         payload_b64 = base64.b64encode(b"\x08\x01").decode()
         for action in ["invalid-base64", "request-id-mismatch", "version-mismatch", "unknown-action", "oversized"]:

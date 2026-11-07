@@ -12,6 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(readonly, copy) NSString *requestId;
 - (BOOL)claimReplacement;
 - (BOOL)claimOriginal;
+- (BOOL)claimInFlightDecrement;
 - (BOOL)isResolved;
 @end
 

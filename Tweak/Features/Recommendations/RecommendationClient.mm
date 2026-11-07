@@ -5,12 +5,25 @@ NSString *YTRCActionReplace(void) { return @"replace"; }
 NSString *YTRCActionPassthrough(void) { return @"passthrough"; }
 NSUInteger const YTRCProtocolVersion = 1;
 NSString * const YTRCServerTokenKey = @"YTKACE.Recommendations.ServerToken";
+NSString * const YTRCTimeoutKey = @"YTKACE.Recommendations.TimeoutMS";
 
 static NSString *YTRCServerURLKey = @"YTKACE.Recommendations.ServerURL";
-static NSString *YTRCTimeoutKey = @"YTKACE.Recommendations.TimeoutMS";
 static NSString *YTRCMaxPayloadKey = @"YTKACE.Recommendations.MaxPayloadBytes";
 static const NSUInteger YTRCFallbackMaxPayloadBytes = 8 * 1024 * 1024;
-static const NSTimeInterval YTRCFallbackTimeout = 2.0;
+static const NSUInteger YTRCFallbackTimeoutMS = 300; // Default 300 ms
+
+NSUInteger YTRCConfiguredTimeoutMS(void) {
+    id val = [NSUserDefaults.standardUserDefaults objectForKey:YTRCTimeoutKey];
+    if (val != nil) {
+        NSInteger intVal = [val integerValue];
+        if (intVal > 0) return (NSUInteger)intVal;
+    }
+    return YTRCFallbackTimeoutMS;
+}
+
+NSTimeInterval YTRCConfiguredTimeout(void) {
+    return (NSTimeInterval)YTRCConfiguredTimeoutMS() / 1000.0;
+}
 
 NSURL *YTRCEndpointForBaseURL(NSURL *base, NSString *surface) {
     // One canonical endpoint set, per §99. The configured ServerURL is the
@@ -55,10 +68,18 @@ static dispatch_queue_t YTRCClientQueue(void) {
 }
 
 @implementation YTRCTransformReply
-- (instancetype)initWithAction:(NSString *)action payload:(NSData *)payload {
+- (instancetype)initWithAction:(NSString *)action payload:(NSData *)payload statusCode:(NSInteger)statusCode notModified:(BOOL)notModified {
     self = [super init];
-    if (self) { _action = [action copy]; _payload = payload; }
+    if (self) {
+        _action = [action copy];
+        _payload = payload;
+        _statusCode = statusCode;
+        _notModified = notModified;
+    }
     return self;
+}
+- (instancetype)initWithAction:(NSString *)action payload:(NSData *)payload {
+    return [self initWithAction:action payload:payload statusCode:200 notModified:NO];
 }
 @end
 
@@ -145,7 +166,7 @@ YTRCTransformReply *YTRCDecodeTransformReply(NSData *body, NSString *expectedReq
         return nil;
     }
     if ([action isEqualToString:YTRCActionPassthrough()])
-        return [[YTRCTransformReply alloc] initWithAction:action payload:nil];
+        return [[YTRCTransformReply alloc] initWithAction:action payload:nil statusCode:200 notModified:NO];
     if (![reply[@"encoding"] isKindOfClass:NSString.class] ||
         ![reply[@"encoding"] isEqualToString:@"protobuf-base64"]) {
         if (error != nullptr)
@@ -174,7 +195,7 @@ YTRCTransformReply *YTRCDecodeTransformReply(NSData *body, NSString *expectedReq
                     @"replacement payload is empty or exceeds the %lu byte cap", (unsigned long)maxPayloadBytes]}];
         return nil;
     }
-    return [[YTRCTransformReply alloc] initWithAction:action payload:decoded];
+    return [[YTRCTransformReply alloc] initWithAction:action payload:decoded statusCode:200 notModified:NO];
 }
 
 void YTRCSendPlaybackEvent(NSString *event, NSString *videoId, NSDictionary *detail) {
@@ -327,16 +348,89 @@ void YTRCProbeServer(void (^completion)(NSDictionary *, NSError *)) {
     }] resume];
 }
 
+void YTRCFetchServerSettings(void (^completion)(NSArray<NSString *> *aiPrompts, NSError *error)) {
+    NSString *serverURL = [NSUserDefaults.standardUserDefaults stringForKey:YTRCServerURLKey];
+    NSURL *baseURL = serverURL.length != 0 ? [NSURL URLWithString:serverURL] : nil;
+    if (baseURL == nil || baseURL.host.length == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil, [NSError errorWithDomain:YTRCDomain() code:30
+                userInfo:@{NSLocalizedDescriptionKey: @"no valid server URL configured"}]);
+        });
+        return;
+    }
+    NSString *str = baseURL.absoluteString;
+    while ([str hasSuffix:@"/"]) str = [str substringToIndex:str.length - 1];
+    NSURL *url = [NSURL URLWithString:[str stringByAppendingString:@"/yt-settings"]];
+    if (url == nil) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil, [NSError errorWithDomain:YTRCDomain() code:31
+                userInfo:@{NSLocalizedDescriptionKey: @"invalid settings URL"}]);
+        });
+        return;
+    }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"GET";
+    request.timeoutInterval = 4.0;
+    [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    YTRCApplyAuthorization(request);
+    NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+    configuration.HTTPShouldSetCookies = NO;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration
+                                                        delegate:nil delegateQueue:[NSOperationQueue new]];
+    [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *taskError) {
+        [session finishTasksAndInvalidate];
+        void (^finish)(NSArray<NSString *> *, NSError *) = ^(NSArray<NSString *> *prompts, NSError *err) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(prompts, err); });
+        };
+        if (taskError != nil) { finish(nil, taskError); return; }
+        NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
+        if (http.statusCode != 200) {
+            finish(nil, [NSError errorWithDomain:YTRCDomain() code:32 userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"settings returned HTTP %ld", (long)http.statusCode]}]);
+            return;
+        }
+        id json = data.length != 0 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if (![json isKindOfClass:NSDictionary.class]) {
+            finish(nil, [NSError errorWithDomain:YTRCDomain() code:33
+                userInfo:@{NSLocalizedDescriptionKey: @"settings response is not a JSON object"}]);
+            return;
+        }
+        if (!YTRCIsNumberWithValue(((NSDictionary *)json)[@"protocolVersion"], YTRCProtocolVersion)) {
+            finish(nil, [NSError errorWithDomain:YTRCDomain() code:36
+                userInfo:@{NSLocalizedDescriptionKey: @"unsupported settings protocolVersion"}]);
+            return;
+        }
+        NSArray *prompts = ((NSDictionary *)json)[@"aiPrompts"];
+        if (![prompts isKindOfClass:NSArray.class] || prompts.count == 0) {
+            prompts = ((NSDictionary *)json)[@"prompts"];
+        }
+        if (![prompts isKindOfClass:NSArray.class] || prompts.count == 0) {
+            finish(nil, [NSError errorWithDomain:YTRCDomain() code:34
+                userInfo:@{NSLocalizedDescriptionKey: @"no aiPrompts in settings response"}]);
+            return;
+        }
+        NSMutableArray<NSString *> *validPrompts = [NSMutableArray array];
+        for (id p in prompts) {
+            if ([p isKindOfClass:NSString.class] && [(NSString *)p length] > 0) {
+                [validPrompts addObject:(NSString *)p];
+            }
+        }
+        if (validPrompts.count == 0) {
+            finish(nil, [NSError errorWithDomain:YTRCDomain() code:35
+                userInfo:@{NSLocalizedDescriptionKey: @"empty aiPrompts in settings response"}]);
+            return;
+        }
+        finish(validPrompts, nil);
+    }] resume];
+}
+
 void YTRCRequestTransform(NSData *payload, NSString *surface, NSString *phase,
                           NSString *videoId, NSDictionary *requestContext,
                           NSString *responseType,
                           void (^completion)(YTRCTransformReply *, NSError *)) {
     NSString *requestId = NSUUID.UUID.UUIDString;
     NSString *serverURL = [NSUserDefaults.standardUserDefaults stringForKey:YTRCServerURLKey];
-    NSTimeInterval timeout = [NSUserDefaults.standardUserDefaults objectForKey:YTRCTimeoutKey] != nil
-        ? [NSUserDefaults.standardUserDefaults doubleForKey:YTRCTimeoutKey] / 1000.0
-        : YTRCFallbackTimeout;
-    if (timeout <= 0) timeout = YTRCFallbackTimeout;
+    NSTimeInterval timeout = YTRCConfiguredTimeout();
     NSUInteger maxPayloadBytes = [NSUserDefaults.standardUserDefaults objectForKey:YTRCMaxPayloadKey] != nil
         ? (NSUInteger)[NSUserDefaults.standardUserDefaults integerForKey:YTRCMaxPayloadKey]
         : YTRCFallbackMaxPayloadBytes;
@@ -387,6 +481,14 @@ void YTRCRequestTransform(NSData *payload, NSString *surface, NSString *phase,
         [session finishTasksAndInvalidate];
         if (taskError != nil) { finish(nil, taskError); return; }
         NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
+        if (http.statusCode == 304) {
+            YTRCTransformReply *reply = [[YTRCTransformReply alloc] initWithAction:YTRCActionPassthrough()
+                                                                           payload:nil
+                                                                        statusCode:304
+                                                                       notModified:YES];
+            finish(reply, nil);
+            return;
+        }
         if (http.statusCode != 200) {
             finish(nil, [NSError errorWithDomain:YTRCDomain() code:32 userInfo:@{
                 NSLocalizedDescriptionKey: [NSString stringWithFormat:@"server returned HTTP %ld", (long)http.statusCode]}]);

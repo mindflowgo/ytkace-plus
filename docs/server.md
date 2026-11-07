@@ -32,7 +32,7 @@ Default `--action replace` echoes the original bytes plus one extra
 length-delimited field: number 90001, value `RECSRV`. It is an unknown field to
 YouTube's protobuf parser — preserved, ignored, invisible — so the feed renders
 normally while proving the delivered object came from the server. Other modes
-exercise the patch's fallback: `passthrough`, `http-error`, `invalid-base64`,
+exercise the patch's fallback: `passthrough`, `not-modified` (HTTP 304), `http-error`, `invalid-base64`,
 `request-id-mismatch`, `version-mismatch`, `unknown-action`, `oversized`,
 `--delay-ms` (timeouts). Payloads are logged only as sizes + sha256 prefixes;
 `--dump-dir DIR` saves originals for offline work.
@@ -40,7 +40,7 @@ exercise the patch's fallback: `passthrough`, `http-error`, `invalid-base64`,
 ## Saves (watch-page menu)
 
 The player's menu button — tap the video; it hangs below the top-right
-settings cog — offers **Save** / **Save w/ AI**. Before posting, the patch
+settings cog — offers **Transcript** / **AI Summary** (download icons). Before posting, the patch
 gathers the video's transcript the way the released YTKACE does: the active
 video's signed caption-track URL with `fmt=json3` is fetched with a plain
 HTTPS GET (the URL signature is the credential; no account plumbing, no
@@ -54,6 +54,24 @@ the transcript status, and the transcript (raw base64 + extracted readable
 text). `--saves-log <path>` relocates the file, `--no-saves-log` disables
 persistence. The phone shows a small Saved (+ transcript) / error note.
 
+### Settings menu
+
+The in-app Settings modal (via Settings in the player menu) is organized into:
+- **Feeds**:
+  - **Customized Feeds** — master toggle
+  - **- recommendations** — Home, watch next, browse (subscriptions, history)
+  - **- searches** — search results
+  - **- video stats** — hooks playback tracking (`/yt-playback`) and Shorts (`/yt-reels`)
+- **Server**:
+  - **Server URL** — base URL of the custom recommendations server
+  - **Recommend Timeout** — server response timeout in milliseconds (default: 300 ms) before immediately falling back to YouTube's response
+  - **Token** — optional bearer token
+  - **Test connection** — verifies server connectivity and protocol version
+- **Transcripts & AI**:
+  - **Save transcripts & AI** — controls Transcript and AI Summary in the player menu
+  - **- Keep Panel Open** — keeps player menu open after tapping save actions
+- **Statistics** & **Diagnostics**
+
 ## Configure on the phone
 
 - **YTKACE Settings → RECOMMENDATIONS SERVER** (preferred): the patch adds a
@@ -64,15 +82,12 @@ persistence. The phone shows a small Saved (+ transcript) / error note.
   URL probes port 80 and just answers "Connection failed".
 - **Test connection** (recommendations panel, Server section) must answer
   `protocolVersion 1 · service bun-recommendation-server`.
-- Enable **Enable customized recommendations**, then the per-category toggles
-  (recommendations panel; the category toggles appear only once the master
-  switch is on, and apply to requests made after the change):
-  - **Recommend feed** — YouTube-chosen lists: Home, category chips, watch
-    page + related list, other/unresolved browse.
-  - **Subs/History feed** — user-behaviour-owned lists: subscriptions,
-    history, feed teasers.
-  - **Search feed** — search results.
-  - **Video stats** (play time, watch tracking) — reserved, future feature.
+- Enable **Customized Feeds**, then the sub-toggles
+  (the sub-toggles appear only once the master switch is on, and apply to requests made after the change):
+  - **- recommendations** — YouTube-chosen lists (Home, category chips, watch
+    page + related list), subscriptions, history, feed teasers.
+  - **- searches** — search results.
+  - **- video stats** — hooks playback tracking (`/yt-playback`) and Shorts (`/yt-reels`).
 - Caching: identical re-fetched content skips the server for **300 s** on
   Recommend and Subs/History pages (20 s for search), so a quick
   pull-to-refresh with unchanged content does not spam the server. Changing

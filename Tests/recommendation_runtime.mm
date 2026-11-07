@@ -208,6 +208,20 @@ int main(void) {
         CHECK(YTRCEndpointForBaseURL([NSURL URLWithString:@"ftp://s"], @"home") == nil);
         CHECK(YTRCEndpointForBaseURL(nil, @"home") == nil);
         CHECK([YTRCServerTokenKey isEqualToString:@"YTKACE.Recommendations.ServerToken"]);
+        CHECK([YTRCTimeoutKey isEqualToString:@"YTKACE.Recommendations.TimeoutMS"]);
+
+        // Configured timeout default 300 ms, user-adjustable
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:YTRCTimeoutKey];
+        CHECK(YTRCConfiguredTimeoutMS() == 300);
+        CHECK(fabs(YTRCConfiguredTimeout() - 0.3) < 0.001);
+        [NSUserDefaults.standardUserDefaults setInteger:500 forKey:YTRCTimeoutKey];
+        CHECK(YTRCConfiguredTimeoutMS() == 500);
+        CHECK(fabs(YTRCConfiguredTimeout() - 0.5) < 0.001);
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:YTRCTimeoutKey];
+
+        // 304 Not Modified reply shape
+        YTRCTransformReply *r304 = [[YTRCTransformReply alloc] initWithAction:YTRCActionPassthrough() payload:nil statusCode:304 notModified:YES];
+        CHECK(r304.statusCode == 304 && r304.notModified && [r304.action isEqualToString:@"passthrough"]);
 
         NSData *body = [NSJSONSerialization dataWithJSONObject:@{
             @"protocolVersion": @1, @"requestId": @"req-9", @"action": @"replace",
@@ -259,6 +273,8 @@ int main(void) {
         state = [[YTRCDeliveryState alloc] initWithRequestIdentifier:@"d-2"];
         CHECK([state claimOriginal]);
         CHECK(![state claimReplacement]);
+        CHECK([state claimInFlightDecrement]);
+        CHECK(![state claimInFlightDecrement]);
 
         // Concurrent claims produce exactly one winner.
         state = [[YTRCDeliveryState alloc] initWithRequestIdentifier:@"d-3"];

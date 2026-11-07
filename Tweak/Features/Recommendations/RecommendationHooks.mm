@@ -18,49 +18,41 @@ static NSString *const EnabledKey = @"YTKACE.Recommendations.Enabled";
 static NSString *const RecommendKey = @"YTKACE.Recommendations.RecommendEnabled";
 static NSString *const SubsKey = @"YTKACE.Recommendations.SubsHistoryEnabled";
 static NSString *const SearchKey = @"YTKACE.Recommendations.SearchEnabled";
+static NSString *const VideoStatsKey = @"YTKACE.Recommendations.VideoStatsEnabled";
+static NSString *const SaveTranscriptsKey = @"YTKACE.Recommendations.SaveTranscriptsEnabled";
+static NSString *const KeepPanelOpenKey = @"YTKACE.Recommendations.KeepPanelOpenEnabled";
 static NSString *const DiagnosticsKey = @"YTKACE.Recommendations.Diagnostics";
 static NSString *const MarkerFieldKey = @"YTKACE.Recommendations.MarkerField";
 static NSString *const MaxInFlightKey = @"YTKACE.Recommendations.MaxInFlight";
 static const void *WrappedKey = &WrappedKey;
 static const void *ButtonKey = &ButtonKey;
 static const void *MenuRowKey = &MenuRowKey;
-static const void *CogAnchorKey = &CogAnchorKey;
-static const void *CogConstraintsKey = &CogConstraintsKey;
+static const void *DownArrowAnchorKey = &DownArrowAnchorKey;
+static const void *DownArrowConstraintsKey = &DownArrowConstraintsKey;
 
-enum {
-    CounterRecommendDeliveries, CounterSubsDeliveries, CounterSearchDeliveries,
-    CounterTransformsSent, CounterReplacementsDelivered, CounterFallbackDelivered,
-    CounterSkippedDedupe, CounterSkippedMarker, CounterSkippedCap, CounterCount
-};
-static atomic_ullong Counters[CounterCount];
 static atomic_llong InFlightDeliveries;
-static void YTRCBump(int counter) { atomic_fetch_add(&Counters[counter], 1ULL); }
-static unsigned long long YTRCCounter(int counter) { return atomic_load(&Counters[counter]); }
 
 static BOOL YTRCEnabled(NSString *key) {
     return [NSUserDefaults.standardUserDefaults boolForKey:key];
 }
 
-// Three feed categories share the delivery pipeline; each has its own toggle:
+// Feed categories share the delivery pipeline; each has its own toggle:
 //   recommend — YouTube-chosen lists: Home, category chips, watch page +
-//               related list, other/unresolved browse
-//   subs      — user-behaviour-owned lists: FEsubscriptions, FEhistory, teasers
+//               related list, browse (subscriptions, history), teasers
 //   search    — search results
-// "Video stats" (play time / watch tracking) is a reserved future category.
+//   stats     — shorts reel sequence (/yt-reels) and playback events (/yt-playback)
 static NSString *YTRCCategoryForSurface(NSString *surface) {
     if (![surface isKindOfClass:NSString.class] || surface.length == 0) return @"recommend";
     if ([surface isEqualToString:@"search"]) return @"search";
-    if ([surface isEqualToString:@"FEsubscriptions"] ||
-        [surface isEqualToString:@"FEhistory"] ||
-        [surface isEqualToString:@"browse-teaser"]) return @"subs";
-    return @"recommend"; // home, watch, FE*, channel pages, browse-unknown
+    if ([surface isEqualToString:@"shorts"]) return @"stats";
+    return @"recommend"; // home, watch, FE*, channel pages, browse-unknown, FEsubscriptions, FEhistory, browse-teaser
 }
 
 static BOOL YTRCCategoryEnabled(NSString *surface) {
     if (!YTRCEnabled(EnabledKey)) return NO;
     NSString *category = YTRCCategoryForSurface(surface);
     if ([category isEqualToString:@"search"]) return YTRCEnabled(SearchKey);
-    if ([category isEqualToString:@"subs"]) return YTRCEnabled(SubsKey);
+    if ([category isEqualToString:@"stats"]) return YTRCEnabled(VideoStatsKey);
     return YTRCEnabled(RecommendKey);
 }
 
@@ -196,9 +188,6 @@ static void YTRCProcessDelivery(YTRCDeliveryContext *context, id response,
         return;
     }
     context.responseType = observedClass;
-    NSString *category = YTRCCategoryForSurface(context.surface);
-    YTRCBump([category isEqualToString:@"subs"] ? CounterSubsDeliveries
-        : ([category isEqualToString:@"search"] ? CounterSearchDeliveries : CounterRecommendDeliveries));
     NSError *error = nil;
     NSData *payload = YTRCSerializeMessage(response, 16 * 1024 * 1024, &error);
     if (payload == nil || payload.length == 0) {
@@ -212,7 +201,6 @@ static void YTRCProcessDelivery(YTRCDeliveryContext *context, id response,
         YTRCRememberWatchPayload(payload, context.videoId);
     NSString *fingerprint = YTRCSha256Prefix(payload);
     if (![YTRCRecent() shouldTransform:fingerprint ttl:YTRCDedupeTTL(context.surface)]) {
-        YTRCBump(CounterSkippedDedupe);
         YTRCLog(@{@"event": @"delivery", @"requestId": context.requestId, @"surface": context.surface,
                   @"phase": context.phase, @"bytes": @(payload.length), @"decision": @"duplicate-passthrough"});
         deliverNow();
@@ -220,7 +208,6 @@ static void YTRCProcessDelivery(YTRCDeliveryContext *context, id response,
     }
     if (YTRCPayloadHasMarker(payload, YTRCMarkerField())) {
         // An upstream layer already server-replaced this payload.
-        YTRCBump(CounterSkippedMarker);
         YTRCLog(@{@"event": @"delivery", @"requestId": context.requestId, @"surface": context.surface,
                   @"phase": context.phase, @"bytes": @(payload.length), @"decision": @"marker-passthrough"});
         deliverNow();
@@ -228,26 +215,50 @@ static void YTRCProcessDelivery(YTRCDeliveryContext *context, id response,
     }
     long long inFlight = atomic_load(&InFlightDeliveries);
     if (inFlight >= (long long)YTRCMaxInFlight()) {
-        YTRCBump(CounterSkippedCap);
         YTRCLog(@{@"event": @"delivery", @"requestId": context.requestId, @"surface": context.surface,
                   @"phase": context.phase, @"bytes": @(payload.length), @"decision": @"in-flight-cap"});
         deliverNow();
         return;
     }
     atomic_fetch_add(&InFlightDeliveries, 1LL);
-    YTRCBump(CounterTransformsSent);
     YTRCLog(@{@"event": @"transform-sent", @"requestId": context.requestId, @"surface": context.surface,
               @"phase": context.phase, @"bytes": @(payload.length), @"responseType": context.responseType,
               @"fingerprint": fingerprint,
               @"feedType": context.feedType != 0 ? @(context.feedType) : [NSNull null]});
 
     YTRCDeliveryState *state = [[YTRCDeliveryState alloc] initWithRequestIdentifier:context.requestId];
+    NSTimeInterval timeoutSec = YTRCConfiguredTimeout();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if ([state claimOriginal]) {
+            if ([state claimInFlightDecrement]) {
+                atomic_fetch_sub(&InFlightDeliveries, 1LL);
+            }
+            YTRCLog(@{@"event": @"delivered", @"requestId": context.requestId,
+                      @"surface": context.surface, @"outcome": @"original",
+                      @"reason": @"server-timeout",
+                      @"timeoutMs": @(timeoutSec * 1000.0)});
+            deliverNow();
+        }
+    });
+
     dispatch_async(YTRCWorkQueue(), ^{
         YTRCRequestTransform(payload, context.surface, context.phase, context.videoId,
                              context.requestContext, context.responseType,
             ^(YTRCTransformReply *reply, NSError *transformError) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    atomic_fetch_sub(&InFlightDeliveries, 1LL);
+                    if ([state claimInFlightDecrement]) {
+                        atomic_fetch_sub(&InFlightDeliveries, 1LL);
+                    }
+                    if (reply != nil && reply.notModified) {
+                        if ([state claimOriginal]) {
+                            YTRCLog(@{@"event": @"delivered", @"requestId": context.requestId,
+                                      @"surface": context.surface,
+                                      @"outcome": @"original",
+                                      @"reason": @"not-modified-304"});
+                            deliverNow();
+                            return;
+                        }
+                    }
                     BOOL wantReplacement = reply != nil && [reply.action isEqualToString:YTRCActionReplace()];
                     id replacement = nil;
                     NSError *failure = transformError;
@@ -261,7 +272,6 @@ static void YTRCProcessDelivery(YTRCDeliveryContext *context, id response,
                     }
                     BOOL markerSeen = wantReplacement && YTRCPayloadHasMarker(reply.payload, YTRCMarkerField());
                     if (wantReplacement && [state claimReplacement]) {
-                        YTRCBump(CounterReplacementsDelivered);
                         YTRCLog(@{@"event": @"delivered", @"requestId": context.requestId,
                                   @"outcome": @"replacement", @"markerSeen": @(markerSeen),
                                   @"bytes": @(reply.payload.length)});
@@ -271,7 +281,6 @@ static void YTRCProcessDelivery(YTRCDeliveryContext *context, id response,
                     if ([state claimOriginal]) {
                         // Server failure, protocol violation, parse failure, or an
                         // explicit passthrough reply: YouTube gets the original bytes.
-                        YTRCBump(CounterFallbackDelivered);
                         YTRCLog(@{@"event": @"delivered", @"requestId": context.requestId,
                                   @"outcome": @"original",
                                   @"reason": wantReplacement ? @"late-delivery" : (YTRCErrorString(failure) ?: @"passthrough")});
@@ -697,7 +706,7 @@ static void YTRCPlaybackActivate(id receiver, SEL selector, id controller, id vi
     NSString *videoId = YTRCVideoIDFromObject(playbackData) ?: YTRCVideoIDFromObject(video);
     YTRCSetActiveVideoId(videoId);
     YTRCSetActiveVideo(receiver, video);
-    if (YTRCEnabled(EnabledKey)) {
+    if (YTRCEnabled(EnabledKey) && YTRCEnabled(VideoStatsKey)) {
         YTRCSendPlaybackEvent(@"activate", videoId, @{
             @"ad": @(YTRCBoolProperty(receiver, @"isPlayingAd")),
             @"videoClass": NSStringFromClass([video class]) ?: @"nil",
@@ -708,14 +717,14 @@ static void YTRCPlaybackActivate(id receiver, SEL selector, id controller, id vi
 }
 
 static void YTRCPlaybackFinish(id receiver, SEL selector, id controller) {
-    if (YTRCEnabled(EnabledKey)) {
+    if (YTRCEnabled(EnabledKey) && YTRCEnabled(VideoStatsKey)) {
         YTRCSendPlaybackEvent(@"finish", nil, @{@"controllerClass": NSStringFromClass([controller class]) ?: @"nil"});
     }
     ((void (*)(id, SEL, id))OriginalPlaybackFinish)(receiver, selector, controller);
 }
 
 static void YTRCPlaybackPause(id receiver, SEL selector, int reason) {
-    if (YTRCEnabled(EnabledKey)) {
+    if (YTRCEnabled(EnabledKey) && YTRCEnabled(VideoStatsKey)) {
         YTRCSendPlaybackEvent(@"pause", nil, @{@"reason": @(reason)});
     }
     ((void (*)(id, SEL, int))OriginalPlaybackPause)(receiver, selector, reason);
@@ -779,6 +788,7 @@ static void YTRCReelSequenceRetry(id receiver, SEL selector, id request, BOOL re
 @interface YTRCLauncher : NSObject
 + (void)overlay:(UIView *)overlay;      // create/refresh the button in a controls overlay (layout hook)
 + (void)setVisible:(BOOL)visible;       // sync with controls visibility (visibility hooks)
++ (BOOL)isMenuOpen;
 + (void)toggle:(UIButton *)sender;
 + (void)show:(UIButton *)sender;
 + (void)showAiResult:(NSString *)text fromButton:(UIButton *)button;
@@ -788,6 +798,8 @@ static void YTRCReelSequenceRetry(id receiver, SEL selector, id request, BOOL re
 @end
 
 static void YTRCMenuDismiss(void);
+static void YTRCDirectAiReplay(UIButton *anchor);
+static void YTRCSaveCurrentVideo(BOOL ai, NSString * _Nullable prompt, UIButton *anchor);
 
 // Observation wrapper for the InnerTube continuation callbacks whose block
 // shapes are multi-argument and therefore not transformable. The AI Overview
@@ -798,6 +810,11 @@ static void YTRCMenuDismiss(void);
 // be inspected; the app's delivery is untouched.
 static id YTRCCaptureArrayCallback(id block, NSString *tag) {
     if (block == nil) return block;
+    NSNumber *directAttempt = objc_getAssociatedObject(block, kYTAIDirectAttemptKey);
+    if (directAttempt != nil) {
+        // Direct replay continuation callback: do NOT collect into panel items
+        return block;
+    }
     NSString *encoding = YTRCBlockSignature(block);
     if (encoding.length == 0) return block;
     NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:encoding.UTF8String];
@@ -811,15 +828,33 @@ static id YTRCCaptureArrayCallback(id block, NSString *tag) {
         NSMutableArray<NSDictionary *> *summary = [NSMutableArray array];
         NSUInteger index = 0;
         for (id item in items) {
-            if (index++ >= 8) break;
             NSError *error = nil;
-            NSData *bytes = YTRCSerializeMessage(item, 512 * 1024, &error);
-            if (bytes.length == 0) continue;
-            YTAICollectCaptureItem(bytes);
-            NSData *capped = bytes.length > 16384 ? [bytes subdataWithRange:NSMakeRange(0, 16384)] : bytes;
-            [summary addObject:@{@"class": NSStringFromClass([item class]) ?: @"?",
-                                 @"bytes": @(bytes.length),
-                                 @"payload": [capped base64EncodedStringWithOptions:0]}];
+            NSData *bytes = YTRCSerializeMessage(item, 16 * 1024 * 1024, &error);
+            NSString *itemClass = NSStringFromClass([item class]);
+            if (bytes.length == 0) {
+                YTRCLog(@{@"event": @"ai-capture-item-omitted",
+                          @"reason": error ? error.localizedDescription : @"serialization-failed-or-exceeded-16MB",
+                          @"class": itemClass ?: @"?",
+                          @"index": @(index)});
+                index++;
+                continue;
+            }
+            YTAICollectCaptureItemWithClass(bytes, itemClass);
+            YTAIDiagnosticLogEndpoints(bytes, itemClass, @"continuation-capture");
+            if (index < 64) {
+                [summary addObject:@{@"class": itemClass ?: @"?",
+                                     @"originalBytes": @(bytes.length),
+                                     @"capturedBytes": @(bytes.length),
+                                     @"bytes": @(bytes.length),
+                                     @"payload": [bytes base64EncodedStringWithOptions:0]}];
+            } else {
+                YTRCLog(@{@"event": @"ai-capture-item-omitted",
+                          @"reason": @"item-index-exceeded-64-cap",
+                          @"class": itemClass ?: @"?",
+                          @"bytes": @(bytes.length),
+                          @"index": @(index)});
+            }
+            index++;
         }
         YTRCLog(@{@"event": @"continuation-capture", @"tag": tag, @"items": summary});
     };
@@ -930,10 +965,12 @@ static id YTRCPanelCaptureHandler(id block, NSString *kind) {
                   @"bytes": @(bytes.length)});
     };
     if (signature.numberOfArguments == 2) {
+        if ([signature getArgumentTypeAtIndex:1][0] != '@') return block;
         void (^original)(id) = block;
         return [^(id argument) { logFire(argument); original(argument); } copy];
     }
     if (signature.numberOfArguments == 3) {
+        if ([signature getArgumentTypeAtIndex:1][0] != '@') return block;
         const char *auxiliary = [signature getArgumentTypeAtIndex:2];
         if (auxiliary[0] == '@' && auxiliary[1] != '?') {
             void (^original)(id, id) = block;
@@ -1091,11 +1128,18 @@ static void YTRCVideoOverlayLayout(id receiver, SEL selector) {
 }
 
 static void YTRCControlsSetOverlayVisible(id receiver, SEL selector, BOOL visible) {
+    if (!visible && [YTRCLauncher isMenuOpen]) {
+        // Drop-down menu is active; keep player controls visible so the user can interact.
+        return;
+    }
     ((void (*)(id, SEL, BOOL))OriginalControlsSetOverlayVisible)(receiver, selector, visible);
     [YTRCLauncher setVisible:visible];
 }
 
 static void YTRCVideoSetControlsVisible(id receiver, SEL selector, BOOL visible) {
+    if (!visible && [YTRCLauncher isMenuOpen]) {
+        return;
+    }
     ((void (*)(id, SEL, BOOL))OriginalVideoSetControlsVisible)(receiver, selector, visible);
     [YTRCLauncher setVisible:visible];
 }
@@ -1191,7 +1235,8 @@ static void YTRCTeaserContinuation(id receiver, SEL selector, id token, unsigned
     // attachment, click tracking) and retain that data source + arguments
     // separately from generic feed instances.
     if ([token isKindOfClass:NSString.class] && [(NSString *)token hasPrefix:@"kta-"]) {
-        YTAINoteContinuation((NSString *)token);
+        NSString *tokenStr = (NSString *)token;
+        YTAINoteContinuation(tokenStr);
         id service = nil;
         if ([receiver respondsToSelector:@selector(service)])
             service = ((id (*)(id, SEL))objc_msgSend)(receiver, @selector(service));
@@ -1199,24 +1244,35 @@ static void YTRCTeaserContinuation(id receiver, SEL selector, id token, unsigned
         SEL resolve = NSSelectorFromString(@"getInnerTubeUIServiceForActiveIdentity");
         if (service != nil && [service respondsToSelector:resolve])
             innerService = ((id (*)(id, SEL))objc_msgSend)(service, resolve);
+
+        NSString *respSig = YTRCBlockSignature(responseBlock);
+        NSString *errSig = YTRCBlockSignature(errorBlock);
+
         YTRCLog(@{@"event": @"ai-continuation", @"source": @"teaser",
-                  @"tokenPrefix": [(NSString *)token substringToIndex:MIN((NSUInteger)48, [(NSString *)token length])],
+                  @"token": tokenStr,
+                  @"tokenLength": @(tokenStr.length),
+                  @"tokenPrefix": [tokenStr substringToIndex:MIN((NSUInteger)80, tokenStr.length)],
                   @"type": @(continuationType),
                   @"attachment": attachment != nil ? NSStringFromClass([attachment class]) : @"(none)",
                   @"clickTracking": clickTracking != nil ? NSStringFromClass([clickTracking class]) : @"(none)",
                   @"dataSource": NSStringFromClass([receiver class]) ?: @"?",
                   @"service": service != nil ? NSStringFromClass([service class]) : @"(none)",
                   @"innerService": innerService != nil ? NSStringFromClass([innerService class]) : @"(none)",
+                  @"respSignature": respSig ?: @"(none)",
+                  @"errSignature": errSig ?: @"(none)",
                   @"cacheEnabled": @(cacheEnabled),
                   @"alwaysParse": @(alwaysParseFeedNode)});
-        YTAINoteNativeContinuation(receiver, continuationType, attachment, clickTracking, cacheEnabled, alwaysParseFeedNode);
+        YTAINoteNativeContinuation(tokenStr, receiver, continuationType, attachment, clickTracking, cacheEnabled, alwaysParseFeedNode, respSig, errSig);
     }
     // Capture runs ungated (diagnostic only): the AI Overview panel fetches
     // through these continuation callbacks.
     id observed = YTRCCaptureArrayCallback(responseBlock, @"browse-teaser");
     if ([token isKindOfClass:NSString.class] && [(NSString *)token length] != 0) {
+        NSString *tokenStr = (NSString *)token;
         YTRCLog(@{@"event": @"continuation-request", @"tag": @"browse-teaser",
-                  @"tokenPrefix": [(NSString *)token substringToIndex:MIN((NSUInteger)48, [(NSString *)token length])],
+                  @"token": tokenStr,
+                  @"tokenLength": @(tokenStr.length),
+                  @"tokenPrefix": [tokenStr substringToIndex:MIN((NSUInteger)80, tokenStr.length)],
                   @"feedType": @(continuationType)});
     }
     if (!YTRCCategoryEnabled(@"browse-teaser")) {
@@ -1248,11 +1304,44 @@ static void YTRCTeaserContinuationShort(id receiver, SEL selector, id token, BOO
                                         id clickTracking, BOOL alwaysParseFeedNode,
                                         id responseBlock, id errorBlock) {
     YTAICaptureFeedDataSource(receiver, @"teaser-short");
+    if ([token isKindOfClass:NSString.class] && [(NSString *)token hasPrefix:@"kta-"]) {
+        NSString *tokenStr = (NSString *)token;
+        YTAINoteContinuation(tokenStr);
+        id service = nil;
+        if ([receiver respondsToSelector:@selector(service)])
+            service = ((id (*)(id, SEL))objc_msgSend)(receiver, @selector(service));
+        id innerService = nil;
+        SEL resolve = NSSelectorFromString(@"getInnerTubeUIServiceForActiveIdentity");
+        if (service != nil && [service respondsToSelector:resolve])
+            innerService = ((id (*)(id, SEL))objc_msgSend)(service, resolve);
+
+        NSString *respSig = YTRCBlockSignature(responseBlock);
+        NSString *errSig = YTRCBlockSignature(errorBlock);
+
+        YTRCLog(@{@"event": @"ai-continuation", @"source": @"teaser-short",
+                  @"token": tokenStr,
+                  @"tokenLength": @(tokenStr.length),
+                  @"tokenPrefix": [tokenStr substringToIndex:MIN((NSUInteger)80, tokenStr.length)],
+                  @"type": @0,
+                  @"attachment": @"(none)",
+                  @"clickTracking": clickTracking != nil ? NSStringFromClass([clickTracking class]) : @"(none)",
+                  @"dataSource": NSStringFromClass([receiver class]) ?: @"?",
+                  @"service": service != nil ? NSStringFromClass([service class]) : @"(none)",
+                  @"innerService": innerService != nil ? NSStringFromClass([innerService class]) : @"(none)",
+                  @"respSignature": respSig ?: @"(none)",
+                  @"errSignature": errSig ?: @"(none)",
+                  @"cacheEnabled": @(cacheEnabled),
+                  @"alwaysParse": @(alwaysParseFeedNode)});
+        YTAINoteNativeContinuation(tokenStr, receiver, 0, nil, clickTracking, cacheEnabled, alwaysParseFeedNode, respSig, errSig);
+    }
     // Capture runs ungated (diagnostic only).
     id observed = YTRCCaptureArrayCallback(responseBlock, @"browse-teaser-short");
     if ([token isKindOfClass:NSString.class] && [(NSString *)token length] != 0) {
+        NSString *tokenStr = (NSString *)token;
         YTRCLog(@{@"event": @"continuation-request", @"tag": @"browse-teaser-short",
-                  @"tokenPrefix": [(NSString *)token substringToIndex:MIN((NSUInteger)48, [(NSString *)token length])]});
+                  @"token": tokenStr,
+                  @"tokenLength": @(tokenStr.length),
+                  @"tokenPrefix": [tokenStr substringToIndex:MIN((NSUInteger)80, tokenStr.length)]});
     }
     if (!YTRCCategoryEnabled(@"browse-teaser")) {
         ((void (*)(id, SEL, id, BOOL, id, BOOL, id, id))OriginalTeaserContinuationShort)(
@@ -1527,7 +1616,7 @@ static void YTRCInstallHooks(void) {
 @implementation YTRCController
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Recommendations";
+    self.title = @"Settings";
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
         target:self action:@selector(close)];
 }
@@ -1546,40 +1635,52 @@ static void YTRCInstallHooks(void) {
 - (void)tick { if (self.view.window != nil) [self.tableView reloadData]; }
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 4; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
+
+- (NSArray<NSDictionary *> *)cardRows {
+    NSMutableArray *rows = [NSMutableArray array];
+    BOOL feedsOn = YTRCEnabled(EnabledKey);
+    [rows addObject:@{@"title": @"Customized Feeds", @"key": EnabledKey}];
+    if (feedsOn) {
+        [rows addObject:@{@"title": @" - recommendations", @"key": RecommendKey}];
+        [rows addObject:@{@"title": @" - searches", @"key": SearchKey}];
+        [rows addObject:@{@"title": @" - video stats", @"key": VideoStatsKey}];
+    }
+    BOOL saveOn = YTRCEnabled(SaveTranscriptsKey);
+    [rows addObject:@{@"title": @"Save transcripts & AI", @"key": SaveTranscriptsKey}];
+    if (saveOn) {
+        [rows addObject:@{@"title": @" - Keep Panel Open", @"key": KeepPanelOpenKey}];
+    }
+    return rows;
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    // The per-category toggles only exist while the master switch is on.
-    if (section == 0) return YTRCEnabled(EnabledKey) ? 5 : 2;
-    return section == 1 ? 3 : (section == 2 ? 4 : 2);
+    if (section == 0) return [self cardRows].count;
+    if (section == 1) return 4;
+    return 2;
 }
+
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return section == 0 ? @"Feature" : (section == 1 ? @"Server" : (section == 2 ? @"Statistics" : @"Diagnostics"));
+    if (section == 1) return @"Server";
+    if (section == 2) return @"Debugging";
+    return nil;
 }
+
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 1)
-        return @"Server base URL only (scheme://host:port, no path), for example http://192.168.1.10:8046. The patch appends /yt-browse for the Home feed and /yt-next for the watch page + related list. HTTP is dev-only and needs the packaging script's ATS dev flag. The token is sent as an Authorization header when set; it is stored in app preferences, not the Keychain, for now. Responses contain personalized data; send them only to a server you control.";
-    return @"Diagnostics are metadata only: counters, request ids, byte counts, and fallback reasons. No payloads are stored or exported.";
+    return nil;
 }
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
     if (indexPath.section == 0) {
-        BOOL masterOn = YTRCEnabled(EnabledKey);
-        // Video stats is reserved: greyed out, no subtitle. Last row when the
-        // master is on (after the toggles), second row when it is off.
-        if ((masterOn && indexPath.row == 4) || (!masterOn && indexPath.row == 1)) {
-            cell.textLabel.text = @"Video stats";
-            cell.detailTextLabel.text = nil;
-            cell.textLabel.enabled = NO;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            return cell;
-        }
-        NSArray *titles = @[@"Enable customized recommendations", @"Recommend feed", @"Subs/History feed", @"Search feed"];
-        NSString *key = @[EnabledKey, RecommendKey, SubsKey, SearchKey][indexPath.row];
-        cell.textLabel.text = titles[indexPath.row];
+        NSDictionary *item = [self cardRows][indexPath.row];
+        NSString *title = item[@"title"];
+        NSString *key = item[@"key"];
+        cell.textLabel.text = title;
         UISwitch *toggle = [UISwitch new];
         toggle.on = YTRCEnabled(key);
-        toggle.tag = indexPath.row;
-        [toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
+        objc_setAssociatedObject(toggle, "PrefKey", key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        [toggle addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = toggle;
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
     } else if (indexPath.section == 1) {
@@ -1588,6 +1689,9 @@ static void YTRCInstallHooks(void) {
             NSString *url = [NSUserDefaults.standardUserDefaults stringForKey:@"YTKACE.Recommendations.ServerURL"] ?: @"";
             cell.detailTextLabel.text = url.length != 0 ? url : @"Not set";
         } else if (indexPath.row == 1) {
+            cell.textLabel.text = @"Recommend Timeout";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%lu ms", (unsigned long)YTRCConfiguredTimeoutMS()];
+        } else if (indexPath.row == 2) {
             cell.textLabel.text = @"Token";
             NSString *token = [NSUserDefaults.standardUserDefaults stringForKey:@"YTKACE.Recommendations.ServerToken"] ?: @"";
             cell.detailTextLabel.text = token.length != 0 ? @"Configured" : @"Not set";
@@ -1596,42 +1700,32 @@ static void YTRCInstallHooks(void) {
             cell.detailTextLabel.text = nil;
             cell.textLabel.textColor = UIColor.systemBlueColor;
         }
-    } else if (indexPath.section == 2) {
-        NSArray *rows = @[
-            @[[NSString stringWithFormat:@"Deliveries  recommend %llu · subs %llu · search %llu",
-                YTRCCounter(CounterRecommendDeliveries), YTRCCounter(CounterSubsDeliveries),
-                YTRCCounter(CounterSearchDeliveries)], @""],
-            @[[NSString stringWithFormat:@"Server transforms sent %llu", YTRCCounter(CounterTransformsSent)], @""],
-            @[[NSString stringWithFormat:@"Replacements %llu · fallbacks %llu",
-                YTRCCounter(CounterReplacementsDelivered), YTRCCounter(CounterFallbackDelivered)], @""],
-            @[[NSString stringWithFormat:@"Skips  dedupe %llu · marker %llu · cap %llu",
-                YTRCCounter(CounterSkippedDedupe), YTRCCounter(CounterSkippedMarker), YTRCCounter(CounterSkippedCap)], @""]
-        ];
-        cell.textLabel.text = rows[indexPath.row][0];
-        cell.textLabel.font = [UIFont systemFontOfSize:13];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
     } else {
         cell.textLabel.text = indexPath.row == 0 ? @"Export diagnostics" : @"Clear diagnostics";
         cell.textLabel.textColor = indexPath.row == 0 ? UIColor.systemBlueColor : UIColor.systemRedColor;
     }
     return cell;
 }
-- (void)toggleChanged:(UISwitch *)toggle {
-    NSString *key = @[EnabledKey, RecommendKey, SubsKey, SearchKey][toggle.tag];
+
+- (void)switchChanged:(UISwitch *)toggle {
+    NSString *key = objc_getAssociatedObject(toggle, "PrefKey");
+    if (key.length == 0) return;
     [NSUserDefaults.standardUserDefaults setBool:toggle.on forKey:key];
     YTRCLog(@{@"event": @"setting", @"key": key, @"enabled": @(toggle.on)});
-    if (toggle.tag == 0) {
-        [YTRCRecent() clear];
-        [self.tableView reloadData]; // category toggles appear only when on
+    if ([key isEqualToString:EnabledKey] || [key isEqualToString:SaveTranscriptsKey]) {
+        if ([key isEqualToString:EnabledKey]) [YTRCRecent() clear];
+        [self.tableView reloadData];
     }
 }
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == 1 && indexPath.row == 0) [self editServerURL];
-    else if (indexPath.section == 1 && indexPath.row == 1) [self editServerToken];
-    else if (indexPath.section == 1 && indexPath.row == 2) [self testConnection];
-    else if (indexPath.section == 3 && indexPath.row == 0) [self exportDiagnostics];
-    else if (indexPath.section == 3 && indexPath.row == 1) [self clearDiagnostics];
+    else if (indexPath.section == 1 && indexPath.row == 1) [self editServerTimeout];
+    else if (indexPath.section == 1 && indexPath.row == 2) [self editServerToken];
+    else if (indexPath.section == 1 && indexPath.row == 3) [self testConnection];
+    else if (indexPath.section == 2 && indexPath.row == 0) [self exportDiagnostics];
+    else if (indexPath.section == 2 && indexPath.row == 1) [self clearDiagnostics];
 }
 - (void)editServerURL {
     NSString *current = [NSUserDefaults.standardUserDefaults stringForKey:@"YTKACE.Recommendations.ServerURL"] ?: @"";
@@ -1645,6 +1739,25 @@ static void YTRCInstallHooks(void) {
         value = [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         [NSUserDefaults.standardUserDefaults setObject:value forKey:@"YTKACE.Recommendations.ServerURL"];
         [YTRCRecent() clear];
+        [self.tableView reloadData];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+- (void)editServerTimeout {
+    NSUInteger current = YTRCConfiguredTimeoutMS();
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Recommend Timeout"
+        message:@"Server response timeout in milliseconds before falling back to YouTube's response (default 300 ms)."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.text = [NSString stringWithFormat:@"%lu", (unsigned long)current];
+        field.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        NSString *value = alert.textFields.firstObject.text ?: @"";
+        NSInteger ms = [value integerValue];
+        if (ms <= 0) ms = 300;
+        [NSUserDefaults.standardUserDefaults setInteger:ms forKey:YTRCTimeoutKey];
         [self.tableView reloadData];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
@@ -1697,10 +1810,7 @@ static void YTRCInstallHooks(void) {
 }
 - (void)exportDiagnostics {
     dispatch_async(YTRCLogQueue(), ^{
-        NSMutableArray *counters = [NSMutableArray array];
-        for (int index = 0; index < CounterCount; index++)
-            [counters addObject:@(YTRCCounter(index))];
-        NSDictionary *report = @{@"module": @"recommendations", @"counters": counters,
+        NSDictionary *report = @{@"module": @"recommendations",
                                  @"events": LogEvents ?: @[],
                                  @"assistantRequest": YTRCLastAssistantRequestBytes != nil
                                      ? [YTRCLastAssistantRequestBytes base64EncodedStringWithOptions:0] : @"",
@@ -1726,7 +1836,7 @@ static void YTRCInstallHooks(void) {
 }
 - (void)clearDiagnostics {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear diagnostics?"
-        message:@"Removes the in-memory metadata log and counter display resets on next launch." preferredStyle:UIAlertControllerStyleAlert];
+        message:@"Removes the in-memory metadata log." preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
         dispatch_async(YTRCLogQueue(), ^{ [LogEvents removeAllObjects]; });
@@ -1742,34 +1852,45 @@ static void YTRCInstallHooks(void) {
 static const CGFloat YTRCButtonSize = 45.0; // 25% larger than the initial 36 pt
 
 static UIView *YTRCMenuContainer = nil;       // expanded menu (backdrop + panel); nil = collapsed
+static UIStackView *YTRCMenuPanel = nil;      // stack view panel
 static UIButton *YTRCMenuAnchor = nil;        // the launcher button it hangs off
 static UILabel *YTRCNoteLabel = nil;          // transient "Saved"/error feedback
 static __weak UIButton *YTRCOverlayButton = nil; // the live launcher button
+static BOOL YTRCControlsVisible = YES;        // controls overlay visibility state
+static NSArray<NSString *> *YTRCAiPrompts = nil;        // session-duration AI prompts from /yt-settings
+static BOOL YTRCSettingsRequestInFlight = NO;
+static BOOL YTRCSettingsRequestFailed = NO;
+static BOOL YTRCMenuInPromptsMode = NO;                 // tracking whether panel is displaying prompt submenu
 
 static void YTRCMenuDismiss(void) {
+    YTRCMenuInPromptsMode = NO;
     [YTRCMenuContainer removeFromSuperview];
     YTRCMenuContainer = nil;
+    YTRCMenuPanel = nil;
     YTRCMenuAnchor = nil;
+    if (!YTRCControlsVisible && YTRCOverlayButton != nil) {
+        YTRCOverlayButton.userInteractionEnabled = NO;
+        [UIView animateWithDuration:0.2 animations:^{ YTRCOverlayButton.alpha = 0.0; }];
+    }
 }
 
-// The native settings cog sits in the player chrome's top-right region. It is
-// found by hint match ("settings"/"gear" in identifier/label/class) restricted
-// to that region — the same proven strategy the released YTKACE uses — with
-// the topmost candidate winning. If the cog is not in the overlay being laid
-// out, the search walks the whole window, since YouTube builds its chrome in
-// whatever container the current layout uses.
-static BOOL YTRCViewIsCogControl(UIView *view, UIView *coordinateView, UIView *exclude) {
+// The innate down-arrow (watch collapse button) sits in the player chrome's
+// top-left region. It is found by watchCollapseButton on the overlay hierarchy
+// or by searching controls in that region.
+static BOOL YTRCViewIsCollapseControl(UIView *view, UIView *coordinateView, UIView *exclude) {
     if (view == exclude || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return NO;
     if ([view.accessibilityIdentifier isEqualToString:@"YTRCLauncherButton"]) return NO;
     if (![view isKindOfClass:UIControl.class] && ![view isKindOfClass:UIImageView.class]) return NO;
+
     NSString *hint = [[NSString stringWithFormat:@"%@ %@ %@",
         view.accessibilityIdentifier ?: @"", view.accessibilityLabel ?: @"",
         NSStringFromClass(view.class)] lowercaseString];
-    if ([hint rangeOfString:@"settings"].location == NSNotFound &&
-        [hint rangeOfString:@"gear"].location == NSNotFound) return NO;
-    // The cog must be actually on screen: its whole ancestor chain visible.
-    // Orientation/fullscreen transitions leave the old cog behind in a hidden
-    // container — anchoring to that parked the button at the window origin.
+    BOOL matchesHint = [hint rangeOfString:@"collapse"].location != NSNotFound ||
+                       [hint rangeOfString:@"down"].location != NSNotFound ||
+                       [hint rangeOfString:@"chevron"].location != NSNotFound ||
+                       [hint rangeOfString:@"minimize"].location != NSNotFound ||
+                       [hint rangeOfString:@"dismiss"].location != NSNotFound;
+
     for (UIView *ancestor = view; ancestor != nil; ancestor = ancestor.superview) {
         if (ancestor.hidden || ancestor.alpha < 0.05) return NO;
     }
@@ -1778,29 +1899,50 @@ static BOOL YTRCViewIsCogControl(UIView *view, UIView *coordinateView, UIView *e
     CGFloat height = CGRectGetHeight(coordinateView.bounds);
     CGFloat centerX = CGRectGetMidX(frame);
     CGFloat centerY = CGRectGetMidY(frame);
-    return isfinite(centerX) && isfinite(centerY) &&
-        centerX > width * 0.55 && centerY < height * 0.35 &&
-        CGRectIntersectsRect(frame, coordinateView.bounds);
+    if (!isfinite(centerX) || !isfinite(centerY)) return NO;
+    if (centerX >= width * 0.40 || centerY >= height * 0.35) return NO;
+    if (!CGRectIntersectsRect(frame, coordinateView.bounds)) return NO;
+
+    return matchesHint || (centerX > 0.0 && centerY > 0.0);
 }
 
-static void YTRCFindCogControlInView(UIView *view, UIView *exclude, UIView *coordinateView,
-                                     UIView **best, CGFloat *bestScore) {
-    if (YTRCViewIsCogControl(view, coordinateView, exclude)) {
+static void YTRCFindCollapseControlInView(UIView *view, UIView *exclude, UIView *coordinateView,
+                                         UIView **best, CGFloat *bestScore) {
+    SEL sel = NSSelectorFromString(@"watchCollapseButton");
+    if ([view respondsToSelector:sel]) {
+        id btn = ((id (*)(id, SEL))objc_msgSend)(view, sel);
+        if ([btn isKindOfClass:UIView.class]) {
+            *best = (UIView *)btn;
+            *bestScore = CGFLOAT_MAX;
+            return;
+        }
+    }
+    if (YTRCViewIsCollapseControl(view, coordinateView, exclude)) {
         CGRect frame = [view convertRect:view.bounds toView:coordinateView];
-        CGFloat score = -CGRectGetMidY(frame); // topmost candidate wins
+        NSString *hint = [[NSString stringWithFormat:@"%@ %@ %@",
+            view.accessibilityIdentifier ?: @"", view.accessibilityLabel ?: @"",
+            NSStringFromClass(view.class)] lowercaseString];
+        BOOL matchesHint = [hint rangeOfString:@"collapse"].location != NSNotFound ||
+                           [hint rangeOfString:@"down"].location != NSNotFound ||
+                           [hint rangeOfString:@"chevron"].location != NSNotFound ||
+                           [hint rangeOfString:@"minimize"].location != NSNotFound ||
+                           [hint rangeOfString:@"dismiss"].location != NSNotFound;
+        // Leftmost candidate in the top region wins; prioritize matching hints
+        CGFloat score = -CGRectGetMinX(frame) - CGRectGetMinY(frame) * 0.5 + (matchesHint ? 10000.0 : 0.0);
         if (*best == nil || score > *bestScore) {
             *best = view;
             *bestScore = score;
         }
     }
-    for (UIView *subview in view.subviews)
-        YTRCFindCogControlInView(subview, exclude, coordinateView, best, bestScore);
+    for (UIView *subview in view.subviews) {
+        YTRCFindCollapseControlInView(subview, exclude, coordinateView, best, bestScore);
+    }
 }
 
-static UIView *YTRCFindCogControl(UIView *root, UIView *exclude) {
+static UIView *YTRCFindCollapseControl(UIView *root, UIView *exclude) {
     UIView *best = nil;
     CGFloat bestScore = -CGFLOAT_MAX;
-    YTRCFindCogControlInView(root, exclude, root, &best, &bestScore);
+    YTRCFindCollapseControlInView(root, exclude, root, &best, &bestScore);
     return best;
 }
 
@@ -1819,12 +1961,14 @@ static void YTRCShowNote(UIButton *anchor, NSString *text, BOOL success) {
     label.textAlignment = NSTextAlignmentCenter;
     label.translatesAutoresizingMaskIntoConstraints = NO;
     [window addSubview:label];
+    UIView *topRef = (YTRCMenuPanel != nil && YTRCMenuPanel.window != nil) ? YTRCMenuPanel : anchor;
     [NSLayoutConstraint activateConstraints:@[
-        [label.centerXAnchor constraintEqualToAnchor:anchor.centerXAnchor],
-        [label.topAnchor constraintEqualToAnchor:anchor.bottomAnchor constant:10],
+        [label.centerXAnchor constraintEqualToAnchor:topRef.centerXAnchor],
+        [label.topAnchor constraintEqualToAnchor:topRef.bottomAnchor constant:10],
         [label.heightAnchor constraintEqualToConstant:28],
         [label.widthAnchor constraintGreaterThanOrEqualToConstant:96]
     ]];
+    [window bringSubviewToFront:label];
     YTRCNoteLabel = label;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (YTRCNoteLabel != label) return;
@@ -1840,31 +1984,174 @@ static void YTRCShowNote(UIButton *anchor, NSString *text, BOOL success) {
 static UIButton *YTRCMenuRow(NSString *title, NSString *symbol, UIButton *anchor,
                              dispatch_block_t action) {
     UIButton *row = [UIButton buttonWithType:UIButtonTypeSystem];
-    row.tintColor = UIColor.whiteColor;
-    row.titleLabel.font = [UIFont systemFontOfSize:21 weight:UIFontWeightMedium];
-    [row setTitle:title forState:UIControlStateNormal];
-    [row setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    UIImageSymbolConfiguration *symbols =
-        [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightMedium];
-    [row setPreferredSymbolConfiguration:symbols forImageInState:UIControlStateNormal];
-    [row setImage:[UIImage systemImageNamed:symbol withConfiguration:symbols] forState:UIControlStateNormal];
-    row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    // Legacy insets are honored for configuration-less system buttons (iOS 16
-    // target); UIButtonConfiguration is never set on these rows.
-    row.contentEdgeInsets = UIEdgeInsetsMake(0, 18, 0, 15);
-    row.imageEdgeInsets = UIEdgeInsetsMake(0, 0, 0, 12); // icon -> title gap
-#pragma clang diagnostic pop
     row.translatesAutoresizingMaskIntoConstraints = NO;
     [row.heightAnchor constraintEqualToConstant:63].active = YES;
-    [row.widthAnchor constraintEqualToConstant:285].active = YES;
+    [row.widthAnchor constraintEqualToConstant:290].active = YES;
+
+    UIImageView *iconView = [[UIImageView alloc] init];
+    iconView.translatesAutoresizingMaskIntoConstraints = NO;
+    iconView.contentMode = UIViewContentModeScaleAspectFit;
+    iconView.tintColor = UIColor.whiteColor;
+    iconView.userInteractionEnabled = NO;
+    UIImageSymbolConfiguration *symbols =
+        [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightMedium];
+    iconView.image = [UIImage systemImageNamed:symbol withConfiguration:symbols];
+    [row addSubview:iconView];
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLabel.font = [UIFont systemFontOfSize:21 weight:UIFontWeightMedium];
+    titleLabel.textColor = UIColor.whiteColor;
+    titleLabel.text = title;
+    titleLabel.userInteractionEnabled = NO;
+    [row addSubview:titleLabel];
+
+    // Icon sits in a fixed 28-pt column starting at x = 22 pt.
+    // Title label starts at x = 74 pt (24 pt gap after icon), so every row's
+    // title text is perfectly vertically aligned with each other.
+    [NSLayoutConstraint activateConstraints:@[
+        [iconView.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:22],
+        [iconView.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [iconView.widthAnchor constraintEqualToConstant:28],
+        [iconView.heightAnchor constraintEqualToConstant:28],
+
+        [titleLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:74],
+        [titleLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [titleLabel.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-16]
+    ]];
+
+    objc_setAssociatedObject(row, "RowTitle", title, OBJC_ASSOCIATION_COPY_NONATOMIC);
     objc_setAssociatedObject(row, MenuRowKey, action, OBJC_ASSOCIATION_COPY_NONATOMIC);
     [row addTarget:YTRCLauncher.class action:@selector(rowTapped:) forControlEvents:UIControlEventTouchUpInside];
     return row;
 }
 
-static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor);
+static void YTRCSaveCurrentVideo(BOOL ai, NSString * _Nullable prompt, UIButton *anchor);
+static void YTRCMenuPopulateMain(UIStackView *panel, UIButton *button);
+static void YTRCMenuPopulatePrompts(UIStackView *panel, UIButton *button);
+
+static UIButton *YTRCPromptRow(NSString *prompt, UIButton *anchor, dispatch_block_t action) {
+    UIButton *row = [UIButton buttonWithType:UIButtonTypeSystem];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    [row.heightAnchor constraintEqualToConstant:66].active = YES;
+    [row.widthAnchor constraintEqualToConstant:290].active = YES;
+
+    UIImageView *iconView = [[UIImageView alloc] init];
+    iconView.translatesAutoresizingMaskIntoConstraints = NO;
+    iconView.contentMode = UIViewContentModeScaleAspectFit;
+    iconView.tintColor = UIColor.whiteColor;
+    iconView.userInteractionEnabled = NO;
+    UIImageSymbolConfiguration *symbols =
+        [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium];
+    iconView.image = [UIImage systemImageNamed:@"sparkles" withConfiguration:symbols];
+    [row addSubview:iconView];
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    titleLabel.textColor = UIColor.whiteColor;
+    titleLabel.text = prompt;
+    titleLabel.numberOfLines = 2;
+    titleLabel.lineBreakMode = NSLineBreakByWordWrapping;
+    titleLabel.userInteractionEnabled = NO;
+    [row addSubview:titleLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [iconView.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:18],
+        [iconView.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [iconView.widthAnchor constraintEqualToConstant:24],
+        [iconView.heightAnchor constraintEqualToConstant:24],
+
+        [titleLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:52],
+        [titleLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [titleLabel.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-14]
+    ]];
+
+    objc_setAssociatedObject(row, "RowTitle", prompt, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(row, MenuRowKey, action, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    [row addTarget:YTRCLauncher.class action:@selector(rowTapped:) forControlEvents:UIControlEventTouchUpInside];
+    return row;
+}
+
+static void YTRCTriggerSettingsFetch(UIButton *button) {
+    if (YTRCAiPrompts != nil || YTRCSettingsRequestInFlight) return;
+    YTRCSettingsRequestInFlight = YES;
+    YTRCSettingsRequestFailed = NO;
+    YTRCFetchServerSettings(^(NSArray<NSString *> *prompts, NSError *error) {
+        YTRCSettingsRequestInFlight = NO;
+        if (prompts.count > 0) {
+            YTRCAiPrompts = prompts;
+            YTRCSettingsRequestFailed = NO;
+            YTRCLog(@{@"event": @"settings-prompts", @"count": @(prompts.count)});
+        } else {
+            YTRCAiPrompts = nil;
+            YTRCSettingsRequestFailed = YES;
+            YTRCLog(@{@"event": @"settings-prompts", @"error": error.localizedDescription ?: @"failed"});
+        }
+        if (YTRCMenuContainer != nil && YTRCMenuPanel != nil) {
+            if (YTRCMenuInPromptsMode) {
+                YTRCMenuPopulatePrompts(YTRCMenuPanel, YTRCMenuAnchor ?: button);
+            } else {
+                YTRCMenuPopulateMain(YTRCMenuPanel, YTRCMenuAnchor ?: button);
+            }
+        }
+    });
+}
+
+static void YTRCMenuPopulateMain(UIStackView *panel, UIButton *button) {
+    YTRCMenuInPromptsMode = NO;
+    for (UIView *view in [panel.arrangedSubviews copy]) {
+        [panel removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+    if (YTRCEnabled(SaveTranscriptsKey)) {
+        [panel addArrangedSubview:YTRCMenuRow(@"Transcript", @"arrow.down.to.line", button, ^{
+            YTRCSaveCurrentVideo(NO, nil, button);
+        })];
+        UIButton *aiRow = YTRCMenuRow(@"AI Summary", @"arrow.down.to.line", button, ^{
+            if (YTRCSettingsRequestFailed) return;
+            YTRCMenuPopulatePrompts(panel, button);
+        });
+        if (YTRCSettingsRequestFailed) {
+            aiRow.enabled = NO;
+            aiRow.alpha = 0.4;
+        }
+        [panel addArrangedSubview:aiRow];
+    }
+    [panel addArrangedSubview:YTRCMenuRow(@"Settings", @"gearshape", button, ^{
+        [YTRCLauncher show:button];
+    })];
+}
+
+static void YTRCMenuPopulatePrompts(UIStackView *panel, UIButton *button) {
+    YTRCMenuInPromptsMode = YES;
+    for (UIView *view in [panel.arrangedSubviews copy]) {
+        [panel removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+    // Back item to return to main menu
+    [panel addArrangedSubview:YTRCMenuRow(@"Back", @"chevron.left", button, ^{
+        YTRCMenuPopulateMain(panel, button);
+    })];
+
+    if (YTRCAiPrompts != nil && YTRCAiPrompts.count > 0) {
+        for (NSString *prompt in YTRCAiPrompts) {
+            [panel addArrangedSubview:YTRCPromptRow(prompt, button, ^{
+                YTRCSaveCurrentVideo(YES, prompt, button);
+            })];
+        }
+    } else if (YTRCSettingsRequestInFlight) {
+        UIButton *loadingRow = YTRCMenuRow(@"Loading prompts…", @"arrow.triangle.2.circlepath", button, nil);
+        loadingRow.enabled = NO;
+        loadingRow.alpha = 0.6;
+        [panel addArrangedSubview:loadingRow];
+    } else if (YTRCSettingsRequestFailed) {
+        UIButton *failedRow = YTRCMenuRow(@"Prompts unavailable", @"exclamationmark.triangle", button, nil);
+        failedRow.enabled = NO;
+        failedRow.alpha = 0.4;
+        [panel addArrangedSubview:failedRow];
+    }
+}
 
 static void YTRCMenuShow(UIButton *button) {
     UIWindow *window = button.window;
@@ -1879,7 +2166,6 @@ static void YTRCMenuShow(UIButton *button) {
         [container.leadingAnchor constraintEqualToAnchor:window.leadingAnchor],
         [container.trailingAnchor constraintEqualToAnchor:window.trailingAnchor]
     ]];
-    // Tap anywhere outside the panel reverts to the collapsed button.
     UIControl *backdrop = [UIControl new];
     backdrop.backgroundColor = UIColor.clearColor;
     backdrop.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1902,32 +2188,62 @@ static void YTRCMenuShow(UIButton *button) {
     panel.layoutMarginsRelativeArrangement = YES;
     panel.translatesAutoresizingMaskIntoConstraints = NO;
     [container addSubview:panel];
-    [panel addArrangedSubview:YTRCMenuRow(@"Save", @"text.quote", button, ^{
-        YTRCSaveCurrentVideo(NO, button);
-    })];
-    [panel addArrangedSubview:YTRCMenuRow(@"Save w/ AI", @"sparkles", button, ^{
-        YTRCSaveCurrentVideo(YES, button);
-    })];
-    [panel addArrangedSubview:YTRCMenuRow(@"Settings", @"gearshape", button, ^{
-        [YTRCLauncher show:button];
-    })];
-    // The button hangs under the top-right cog, so the panel drops downward.
+
+    YTRCMenuContainer = container;
+    YTRCMenuPanel = panel;
+    YTRCMenuAnchor = button;
+
+    YTRCMenuPopulateMain(panel, button);
+
     [NSLayoutConstraint activateConstraints:@[
-        [panel.trailingAnchor constraintEqualToAnchor:button.trailingAnchor],
+        [panel.leadingAnchor constraintEqualToAnchor:button.leadingAnchor],
         [panel.topAnchor constraintEqualToAnchor:button.bottomAnchor constant:8]
     ]];
-    YTRCMenuContainer = container;
-    YTRCMenuAnchor = button;
     container.alpha = 0.0;
     [UIView animateWithDuration:0.12 animations:^{ container.alpha = 1.0; }];
 }
 
-static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
+__attribute__((unused)) static void YTRCDirectAiReplay(UIButton *anchor) {
+    NSString *videoId = YTRCActiveVideoId;
+    if (!YTAICanReplayDirect(videoId)) {
+        YTRCShowNote(anchor, @"Run Save w/ AI once first", NO);
+        return;
+    }
+    YTRCShowNote(anchor, @"Direct AI Replaying…", YES);
+    YTAIReplayDirect(videoId, ^(NSString *summary, NSString *status) {
+        if (summary.length != 0) {
+            YTRCFetchTranscript(videoId, ^(NSData *transcript, NSString *transcriptStatus) {
+                YTRCSendSaveRequest(videoId, YES, transcript, @"youtube-json3", transcriptStatus, summary, status,
+                    ^(BOOL ok, NSString *message) {
+                        YTRCShowNote(anchor, ok ? @"Direct AI: Saved!" : message, ok);
+                    });
+            });
+        } else {
+            YTRCShowNote(anchor, [@"Direct AI failed: " stringByAppendingString:status ?: @"unknown"], NO);
+        }
+    });
+}
+
+static BOOL YTRCAiFirstQueryDone = NO;
+static NSUInteger YTRCActiveSaveJobToken = 0;
+
+static void YTRCSaveCurrentVideo(BOOL ai, NSString * _Nullable prompt, UIButton *anchor) {
+    // Immediately cancel and invalidate all prior in-flight AI captures, replays, and UI state
+    YTAICancelActiveOperations();
     YTRCShowNote(anchor, @"Saving…", YES);
     NSString *videoId = YTRCActiveVideoId;
+    NSUInteger currentJobToken = ++YTRCActiveSaveJobToken;
     // Gather the transcript first (fail-soft, bounded), then — for Save w/ AI
     // — replay the AI Overview request, then post everything together.
     YTRCFetchTranscript(videoId, ^(NSData *transcript, NSString *transcriptStatus) {
+        // Validate navigation: if user navigated to another video during transcript fetch, abort cleanly
+        if (currentJobToken != YTRCActiveSaveJobToken || (videoId != nil && ![videoId isEqualToString:YTRCActiveVideoId])) {
+            YTRCLog(@{@"event": @"ai-save", @"outcome": @"aborted-user-navigated",
+                      @"targetVideo": videoId ?: @"", @"currentVideo": YTRCActiveVideoId ?: @""});
+            YTRCShowNote(anchor, @"Video changed", NO);
+            return;
+        }
+
         if (!ai) {
             YTRCSendSaveRequest(videoId, NO, transcript, @"youtube-json3", transcriptStatus, nil, nil,
                 ^(BOOL ok, NSString *message) {
@@ -1936,14 +2252,36 @@ static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
                 });
             return;
         }
-        YTRCShowNote(anchor, @"Asking Gemini…", YES);
-        YTAIFetchSummary(videoId, ^(NSString *summary, NSString *aiStatus) {
+
+        BOOL keepPanelOpen = YTRCEnabled(KeepPanelOpenKey);
+        BOOL directSupported = YTAIDirectSupportsOperation(prompt);
+
+        __block BOOL saveHandled = NO;
+        void (^processAiResult)(NSString *, NSString *) = ^(NSString *summary, NSString *aiStatus) {
+            if (saveHandled) return;
+            saveHandled = YES;
+            if (currentJobToken != YTRCActiveSaveJobToken || (videoId != nil && ![videoId isEqualToString:YTRCActiveVideoId])) {
+                YTRCLog(@{@"event": @"ai-save", @"outcome": @"aborted-user-navigated-during-ai",
+                          @"targetVideo": videoId ?: @"", @"currentVideo": YTRCActiveVideoId ?: @""});
+                YTRCShowNote(anchor, @"Video changed", NO);
+                return;
+            }
             YTRCSendSaveRequest(videoId, YES, transcript, @"youtube-json3", transcriptStatus, summary, aiStatus,
                 ^(BOOL ok, NSString *message) {
+                    if (currentJobToken != YTRCActiveSaveJobToken || (videoId != nil && ![videoId isEqualToString:YTRCActiveVideoId])) {
+                        YTRCLog(@{@"event": @"ai-save", @"outcome": @"aborted-superseded-during-send",
+                                  @"targetVideo": videoId ?: @"", @"currentVideo": YTRCActiveVideoId ?: @""});
+                        return;
+                    }
                     if (summary.length != 0) {
-                        YTAICloseAiPanel();
+                        if (!keepPanelOpen) {
+                            YTAICloseAiPanel();
+                        }
                         YTRCShowNote(anchor, ok ? @"Saved + AI overview" : message, ok);
                     } else {
+                        if (!keepPanelOpen) {
+                            YTAICloseAiPanel();
+                        }
                         if (ok) {
                             YTRCShowNote(anchor, @"Saved", YES);
                             [YTRCLauncher showAiGuidance:aiStatus fromButton:anchor];
@@ -1952,6 +2290,82 @@ static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
                         }
                     }
                 });
+        };
+
+        if (keepPanelOpen) {
+            // "If 'Keep Panel Open', it should ALWAYS use the AI Panel method, and LEAVE IT OPEN."
+            YTRCShowNote(anchor, @"Asking Gemini (Panel)…", YES);
+            YTAIFetchSummaryWithPrompt(videoId, prompt, ^(NSString *summary, NSString *aiStatus) {
+                if (summary.length != 0) YTRCAiFirstQueryDone = YES;
+                processAiResult(summary, aiStatus);
+            });
+            return;
+        }
+
+        // Unsupported direct operations (e.g. custom prompts like "List 5 similar videos...")
+        // route silently to the panel executor without substituting a default direct summary
+        if (!directSupported) {
+            YTRCShowNote(anchor, @"Asking Gemini (Panel)…", YES);
+            YTAIFetchSummaryWithPrompt(videoId, prompt, ^(NSString *summary, NSString *aiStatus) {
+                if (summary.length != 0) YTRCAiFirstQueryDone = YES;
+                processAiResult(summary, aiStatus);
+            });
+            return;
+        }
+
+        if (!YTRCAiFirstQueryDone) {
+            // "If the 'Keep Panel Open' in settings is off, we want to do the FIRST query with AI Panel (and close it)"
+            YTRCShowNote(anchor, @"Asking Gemini (Panel)…", YES);
+            YTAIFetchSummaryWithPrompt(videoId, prompt, ^(NSString *summary, NSString *aiStatus) {
+                if (summary.length != 0) {
+                    YTRCAiFirstQueryDone = YES;
+                    processAiResult(summary, aiStatus);
+                    return;
+                }
+                // AI Panel failed (e.g. Ask button not visible on screen, ai-panel-ui-timeout).
+                // Immediately fallback to Direct method so the user's save request succeeds!
+                if (currentJobToken != YTRCActiveSaveJobToken || (videoId != nil && ![videoId isEqualToString:YTRCActiveVideoId])) {
+                    YTRCLog(@{@"event": @"ai-save", @"outcome": @"aborted-user-navigated-before-fallback",
+                              @"targetVideo": videoId ?: @"", @"currentVideo": YTRCActiveVideoId ?: @""});
+                    YTRCShowNote(anchor, @"Video changed", NO);
+                    return;
+                }
+                YTRCLog(@{@"event": @"ai-save", @"outcome": @"panel-first-failed-fallback-direct",
+                          @"status": aiStatus ?: @"unknown", @"videoId": videoId ?: @""});
+                YTRCShowNote(anchor, @"Asking Gemini (Direct)…", YES);
+                YTAIReplayDirect(videoId, ^(NSString *directSummary, NSString *directStatus) {
+                    if (directSummary.length != 0) {
+                        processAiResult(directSummary, directStatus);
+                    } else {
+                        processAiResult(nil, aiStatus ?: directStatus);
+                    }
+                });
+            });
+            return;
+        }
+
+        // "then after that it should do the direct method (if the direct method FAILED, it shoudl immediately fallback to AI Panel method."
+        YTRCShowNote(anchor, @"Asking Gemini (Direct)…", YES);
+        YTAIReplayDirect(videoId, ^(NSString *directSummary, NSString *directStatus) {
+            if (directSummary.length != 0) {
+                processAiResult(directSummary, directStatus);
+            } else {
+                // Direct method failed: invalidate direct attempt before starting panel so late callbacks are discarded
+                YTAIInvalidateDirectAttempts();
+                if (currentJobToken != YTRCActiveSaveJobToken || (videoId != nil && ![videoId isEqualToString:YTRCActiveVideoId])) {
+                    YTRCLog(@{@"event": @"ai-save", @"outcome": @"aborted-user-navigated-before-fallback",
+                              @"targetVideo": videoId ?: @"", @"currentVideo": YTRCActiveVideoId ?: @""});
+                    YTRCShowNote(anchor, @"Video changed", NO);
+                    return;
+                }
+                YTRCLog(@{@"event": @"ai-save", @"outcome": @"direct-failed-fallback",
+                          @"status": directStatus ?: @"unknown", @"videoId": videoId ?: @""});
+                YTRCShowNote(anchor, @"Asking Gemini (Panel)…", YES);
+                YTAIFetchSummaryWithPrompt(videoId, prompt, ^(NSString *fallbackSummary, NSString *fallbackStatus) {
+                    if (fallbackSummary.length != 0) YTRCAiFirstQueryDone = YES;
+                    processAiResult(fallbackSummary, fallbackStatus);
+                });
+            }
         });
     });
 }
@@ -1959,12 +2373,13 @@ static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
 @implementation YTRCLauncher
 // Layout tick (both overlay classes): the button is hosted at WINDOW level —
 // the only placement proven to render across YouTube's overlay churn — and
-// constrained directly to the discovered settings cog (a shared ancestor with
-// the window, so cross-hierarchy constraints resolve). No cog yet: the button
-// stays hidden; a later tick anchors it.
+// constrained directly to the innate down-arrow (watch collapse button)
+// discovered in the player controls overlay hierarchy. No down-arrow yet: the
+// button stays hidden; a later tick anchors it.
 + (void)overlay:(UIView *)overlay {
     UIWindow *window = overlay.window;
     if (window == nil) return;
+    if (!YTRCControlsVisible && YTRCOverlayButton != nil && YTRCOverlayButton.alpha == 0.0) return;
     UIButton *button = objc_getAssociatedObject(window, ButtonKey);
     if (![button isKindOfClass:UIButton.class]) {
         button = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1972,21 +2387,25 @@ static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
         button.accessibilityLabel = @"Recommendation menu";
         button.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.42];
         button.tintColor = UIColor.whiteColor;
-        UIImageSymbolConfiguration *symbols =
-            [UIImageSymbolConfiguration configurationWithPointSize:19 weight:UIImageSymbolWeightSemibold];
-        [button setPreferredSymbolConfiguration:symbols forImageInState:UIControlStateNormal];
-        [button setImage:[UIImage systemImageNamed:@"chevron.down" withConfiguration:symbols]
-                forState:UIControlStateNormal];
+        UIFont *italicFont = [UIFont fontWithName:@"HelveticaNeue-BoldItalic" size:28];
+        if (!italicFont) italicFont = [UIFont fontWithName:@"HelveticaNeue-Italic" size:28];
+        if (!italicFont) italicFont = [UIFont italicSystemFontOfSize:26];
+        button.titleLabel.font = italicFont;
+        button.titleLabel.textAlignment = NSTextAlignmentCenter;
+        button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+        button.contentVerticalAlignment = UIControlContentVerticalAlignmentCenter;
+        [button setTitle:@"+" forState:UIControlStateNormal];
+        [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         button.layer.cornerRadius = 10;
         button.translatesAutoresizingMaskIntoConstraints = NO;
         button.hidden = YES;
         [button addTarget:self action:@selector(toggle:) forControlEvents:UIControlEventTouchUpInside];
         [window addSubview:button];
-        // Low-priority parking constraints: whenever the cog anchor
+        // Low-priority parking constraints: whenever the collapse anchor
         // constraints are torn down by a layout transition, the button parks
-        // at the top-right instead of collapsing to the window origin.
+        // near the top-left safe area instead of collapsing to the window origin.
         NSLayoutConstraint *parkX =
-            [button.trailingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor constant:-8];
+            [button.leadingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.leadingAnchor constant:64];
         NSLayoutConstraint *parkY =
             [button.topAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.topAnchor constant:8];
         parkX.priority = UILayoutPriorityDefaultLow;
@@ -2001,20 +2420,26 @@ static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
     }
     YTRCOverlayButton = button;
     [window bringSubviewToFront:button];
-    UIView *cog = YTRCFindCogControl(window, button);
-    UIView *anchoredCog = objc_getAssociatedObject(window, CogAnchorKey);
-    NSArray *constraints = objc_getAssociatedObject(window, CogConstraintsKey);
-    BOOL cogValid = cog != nil && cog.superview != nil && !cog.hidden;
-    if (!cogValid) {
-        button.hidden = YES; // no cog in this layout: nothing to hang under
-        YTRCMenuDismiss();
+    UIView *downArrow = YTRCFindCollapseControl(overlay, button);
+    if (downArrow == nil) downArrow = YTRCFindCollapseControl(window, button);
+    UIView *anchoredArrow = objc_getAssociatedObject(window, DownArrowAnchorKey);
+    NSArray *constraints = objc_getAssociatedObject(window, DownArrowConstraintsKey);
+    if (downArrow == nil && anchoredArrow != nil && anchoredArrow.superview != nil) {
+        downArrow = anchoredArrow;
+    }
+    BOOL arrowValid = downArrow != nil && downArrow.superview != nil && !downArrow.hidden;
+    if (!arrowValid) {
+        if (anchoredArrow == nil) {
+            button.hidden = YES; // no collapse button in this layout: nothing to anchor to
+            YTRCMenuDismiss();
+        }
         return;
     }
     button.hidden = NO;
-    BOOL anchored = cog == anchoredCog && constraints.count > 0;
+    BOOL anchored = downArrow == anchoredArrow && constraints.count > 0;
     if (anchored) {
-        // Re-parenting the cog during rotation/fullscreen transitions makes
-        // UIKit auto-remove our cross-view constraints while the view pointer
+        // Re-parenting the collapse button during rotation/fullscreen transitions makes
+        // UIKit auto-remove cross-view constraints while the view pointer
         // stays identical — rebuild whenever the constraints died.
         for (NSLayoutConstraint *constraint in constraints) {
             if (!constraint.isActive) { anchored = NO; break; }
@@ -2022,37 +2447,49 @@ static void YTRCSaveCurrentVideo(BOOL ai, UIButton *anchor) {
     }
     if (anchored) return;
     if (constraints != nil) [NSLayoutConstraint deactivateConstraints:constraints];
-    objc_setAssociatedObject(window, CogAnchorKey, cog, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(window, DownArrowAnchorKey, downArrow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     constraints = @[
-        [button.centerXAnchor constraintEqualToAnchor:cog.centerXAnchor],
-        [button.topAnchor constraintEqualToAnchor:cog.bottomAnchor constant:8]
+        [button.centerYAnchor constraintEqualToAnchor:downArrow.centerYAnchor],
+        [button.leadingAnchor constraintEqualToAnchor:downArrow.trailingAnchor constant:18]
     ];
     [NSLayoutConstraint activateConstraints:constraints];
-    objc_setAssociatedObject(window, CogConstraintsKey, constraints, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    YTRCLog(@{@"event": @"launcher-anchor", @"anchor": NSStringFromClass(cog.class)});
+    objc_setAssociatedObject(window, DownArrowConstraintsKey, constraints, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    YTRCLog(@{@"event": @"launcher-anchor", @"anchor": NSStringFromClass(downArrow.class)});
 }
 // Controls visibility hooks: fade with the chrome; hiding the chrome also
 // collapses any open menu (its anchor is gone).
 + (void)setVisible:(BOOL)visible {
+    YTRCControlsVisible = visible;
     UIButton *button = YTRCOverlayButton;
     if (button == nil) return;
+    if (!visible && YTRCMenuContainer != nil) return;
     if (!visible) YTRCMenuDismiss();
     button.userInteractionEnabled = visible;
     [UIView animateWithDuration:0.2 animations:^{ button.alpha = visible ? 1.0 : 0.0; }];
     // Rotation and fullscreen transitions rebuild the chrome after the final
     // visibility flip; re-check the anchor once the new layout has settled.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *window = YTRCOverlayButton.window;
-        if (window != nil) [YTRCLauncher overlay:window];
-    });
+    if (visible) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIWindow *window = YTRCOverlayButton.window;
+            if (window != nil) [YTRCLauncher overlay:window];
+        });
+    }
+}
++ (BOOL)isMenuOpen {
+    return YTRCMenuContainer != nil;
 }
 + (void)toggle:(UIButton *)sender {
+    YTRCTriggerSettingsFetch(sender);
     if (YTRCMenuContainer != nil) YTRCMenuDismiss();
     else YTRCMenuShow(sender);
 }
 + (void)rowTapped:(UIButton *)row {
     dispatch_block_t action = objc_getAssociatedObject(row, MenuRowKey);
-    YTRCMenuDismiss();
+    NSString *title = objc_getAssociatedObject(row, "RowTitle") ?: row.currentTitle;
+    BOOL isNavigation = [title isEqualToString:@"AI Summary"] || [title isEqualToString:@"Back"];
+    if (!isNavigation) {
+        YTRCMenuDismiss();
+    }
     if (action != nil) action();
 }
 + (void)backdropTapped {
@@ -2089,9 +2526,12 @@ __attribute__((constructor)) static void YTRCStart(void) {
             RecommendKey: @NO,
             SubsKey: @NO,
             SearchKey: @NO,
+            VideoStatsKey: @NO,
+            SaveTranscriptsKey: @YES,
+            KeepPanelOpenKey: @NO,
             @"YTKACE.Recommendations.ServerURL": @"",
             @"YTKACE.Recommendations.ServerToken": @"",
-            @"YTKACE.Recommendations.TimeoutMS": @2000,
+            @"YTKACE.Recommendations.TimeoutMS": @300,
             @"YTKACE.Recommendations.MaxPayloadBytes": @(8 * 1024 * 1024),
             MaxInFlightKey: @8,
             MarkerFieldKey: @90001,

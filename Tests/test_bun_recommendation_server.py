@@ -227,8 +227,19 @@ class BunRecommendationServerTests(unittest.TestCase):
             health = json.loads(response.read().decode())
         self.assertEqual(health["protocolVersion"], 1)
         self.assertEqual(health["service"], "bun-recommendation-server")
-        self.assertEqual(health["endpoints"], ["POST /yt-browse", "POST /yt-next", "POST /yt-search",
+        self.assertEqual(health["endpoints"], ["GET /yt-settings", "POST /yt-browse", "POST /yt-next", "POST /yt-search",
                                                "POST /yt-reels", "POST /yt-playback", "POST /yt-save"])
+
+    def test_settings_returns_ai_prompts(self):
+        with urllib.request.urlopen(self.base + "/yt-settings", timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            settings = json.loads(response.read().decode())
+        self.assertEqual(settings["protocolVersion"], 1)
+        self.assertEqual(settings["aiPrompts"], [
+            "Summarize the core ideas in this video",
+            "List 5 similar videos and summarize their content",
+            "Summarize the core 5 ideas in this video"
+        ])
 
     def test_replace_echoes_payload_with_marker(self):
         payload = bytes([0x08, 0x01])
@@ -944,6 +955,14 @@ class BunRecommendationServerTests(unittest.TestCase):
         post(base + "/yt-next", envelope(payload, request_id="no-api-1"))
         time.sleep(0.3)
         self.assertFalse(Path(logfile).with_name("api.log").exists())
+
+    def test_not_modified_action_returns_304(self):
+        process, base, logfile = start_bun(action="not-modified")
+        self.addCleanup(lambda: (process.terminate(), process.wait(timeout=5)))
+        payload = base64.b64encode(bytes([0x08, 0x01])).decode()
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            post(base + "/yt-browse", envelope(payload, request_id="304-1", surface="home"))
+        self.assertEqual(caught.exception.code, 304)
 
 
 if __name__ == "__main__":

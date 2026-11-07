@@ -30,7 +30,7 @@ import { removeShelves } from "./payload-modifier.ts";
 
 const MARKER_TEXT = "RECSRV";
 const ACTIONS = [
-  "replace", "passthrough", "recode", "invalid-base64", "request-id-mismatch",
+  "replace", "passthrough", "recode", "not-modified", "invalid-base64", "request-id-mismatch",
   "version-mismatch", "unknown-action", "oversized", "http-error",
 ] as const;
 type Action = (typeof ACTIONS)[number];
@@ -1442,6 +1442,10 @@ async function handleTransform(request: Request, path: string): Promise<Response
 
   let reply: Record<string, unknown>;
   let outBytes = 0;
+  if (options.action === "not-modified") {
+    log(`POST ${path} -> HTTP 304 (not-modified)`);
+    return new Response(null, { status: 304, statusText: "Not Modified" });
+  }
   if (options.action === "http-error") {
     log(`POST ${path} -> HTTP 503 (http-error)`);
     return metaJson({ error: "mock transform failure" }, 503, { action: "http-error" });
@@ -1513,12 +1517,23 @@ async function routeRequest(request: Request, url: URL): Promise<Response> {
       service: "bun-recommendation-server",
       defaultAction: options.action,
       markerField: options.markerField,
-      endpoints: ["POST /yt-browse", "POST /yt-next", "POST /yt-search", "POST /yt-reels", "POST /yt-playback", "POST /yt-save"],
+      endpoints: ["GET /yt-settings", "POST /yt-browse", "POST /yt-next", "POST /yt-search", "POST /yt-reels", "POST /yt-playback", "POST /yt-save"],
       lastAuth: state.lastAuth,
       lastPath: state.lastPath,
     };
     log(`GET ${url.pathname} health`);
     return json(health);
+  }
+  if (request.method === "GET" && url.pathname === "/yt-settings") {
+    log(`GET ${url.pathname} settings`);
+    return json({
+      protocolVersion: 1,
+      aiPrompts: [
+        "Summarize the core ideas in this video",
+        "List 5 similar videos and summarize their content",
+        "Summarize the core 5 ideas in this video",
+      ],
+    });
   }
   if (request.method === "POST" && url.pathname === "/yt-playback") {
     return handlePlayback(request);

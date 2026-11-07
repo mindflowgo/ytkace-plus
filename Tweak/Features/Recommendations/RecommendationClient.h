@@ -11,9 +11,12 @@ NS_ASSUME_NONNULL_BEGIN
 // YTKACE.Recommendations.ServerToken is set it is sent as
 // "Authorization: Bearer <token>" on every request.
 FOUNDATION_EXPORT NSString * const YTRCServerTokenKey;
+FOUNDATION_EXPORT NSString * const YTRCTimeoutKey;
 FOUNDATION_EXPORT NSString * _Nonnull YTRCActionReplace(void);   // "replace"
 FOUNDATION_EXPORT NSString * _Nonnull YTRCActionPassthrough(void); // "passthrough"
 FOUNDATION_EXPORT NSUInteger const YTRCProtocolVersion;
+FOUNDATION_EXPORT NSTimeInterval YTRCConfiguredTimeout(void);
+FOUNDATION_EXPORT NSUInteger YTRCConfiguredTimeoutMS(void);
 
 // Maps a configured base URL + surface to the canonical endpoint. Returns nil
 // for an unknown surface, a non-http(s) scheme, or a base that includes a path.
@@ -24,6 +27,10 @@ FOUNDATION_EXPORT NSURL * _Nullable YTRCEndpointForBaseURL(NSURL * _Nullable bas
 @interface YTRCTransformReply : NSObject
 @property(readonly, copy) NSString *action;
 @property(readonly, nullable) NSData *payload;
+@property(readonly) NSInteger statusCode;
+@property(readonly) BOOL notModified;
+- (instancetype)initWithAction:(NSString *)action payload:(NSData * _Nullable)payload statusCode:(NSInteger)statusCode notModified:(BOOL)notModified;
+- (instancetype)initWithAction:(NSString *)action payload:(NSData * _Nullable)payload;
 - (instancetype)init NS_UNAVAILABLE;
 + (instancetype)new NS_UNAVAILABLE;
 @end
@@ -84,5 +91,9 @@ FOUNDATION_EXPORT void YTRCSendSaveRequest(NSString * _Nullable videoId, BOOL ai
 // object advertising protocolVersion 1 (the documented health probe).
 FOUNDATION_EXPORT void YTRCProbeServer(void (^completion)(NSDictionary * _Nullable health,
                                                           NSError * _Nullable error));
+
+// Fetches server runtime settings (GET /yt-settings). Returns the array of AI prompts on success.
+FOUNDATION_EXPORT void YTRCFetchServerSettings(void (^completion)(NSArray<NSString *> * _Nullable aiPrompts,
+                                                                  NSError * _Nullable error));
 
 NS_ASSUME_NONNULL_END

@@ -80,6 +80,16 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- routes ----------
 
     def do_GET(self):
+        if self.path == "/yt-settings":
+            self._send_json(200, {
+                "protocolVersion": 1,
+                "aiPrompts": [
+                    "Summarize the core ideas in this video",
+                    "List 5 similar videos and summarize their content",
+                    "Summarize the core 5 ideas in this video",
+                ],
+            })
+            return
         self._send_json(200, {
             "protocolVersion": 1,
             "service": "mock-recommendation-server",
@@ -121,6 +131,11 @@ class Handler(BaseHTTPRequestHandler):
         self._dump(request_id, payload)
         action = options.action
         fingerprint = hashlib.sha256(payload).hexdigest()[:16]
+
+        if action == "not-modified":
+            self.send_response(304, "Not Modified")
+            self.end_headers()
+            return
 
         if action == "http-error":
             self.send_error(503, "mock transform failure")
@@ -180,7 +195,7 @@ def main(argv=None):
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8046)
     parser.add_argument("--action", default="replace", choices=[
-        "replace", "passthrough", "invalid-base64", "request-id-mismatch",
+        "replace", "passthrough", "not-modified", "invalid-base64", "request-id-mismatch",
         "version-mismatch", "unknown-action", "oversized", "http-error"],
         help="replace echoes the payload plus a marker field (default); "
              "the other modes exercise the patch's fallback paths")

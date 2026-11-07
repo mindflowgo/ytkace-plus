@@ -52,7 +52,7 @@ Two layers: a Mach-O load command and runtime Objective-C hooks.
    defaults, installs the hooks (with retries for late-loading classes), and
    attaches the player-controls **recommendation menu** button (a
    semi-transparent square below the settings cog of the tap-the-video
-   chrome: Save / Save w/ AI / Settings).
+   chrome: Transcript / AI Summary / Settings).
 
 2. **Runtime hooks (30, ABI-checked, fail-closed).** Each hook verifies the
    method's full type encoding before installing (`YTRCMethodMatches`); a
@@ -131,7 +131,7 @@ rejects path-qualified URLs; there are no alternate or legacy endpoint forms):
   `pause` / `finish` (no legacy or alternative event names; anything else is
   rejected with HTTP 400) reported by the patch's player hooks; no payloads.
 - `POST /yt-save` — explicit save requests from the player-controls menu
-  (`Save` / `Save w/ AI`): `{protocolVersion:1, type:"save", videoId, ai,
+  (`Transcript` / `AI Summary`): `{protocolVersion:1, type:"save", videoId, ai,
   transcriptStatus}` and, when the caption fetch succeeded, the raw YouTube
   json3 caption bytes as `transcriptPayload` (base64, declared by
   `transcriptEncoding:"youtube-json3"`). Each accepted save is appended to
